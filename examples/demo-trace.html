@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>agentlens — demo-agent: quarterly-report</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: #0b0f14; color: #e2e8f0;
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: #94a3b8; font-size: 13px; margin-bottom: 16px; }
+  .summary { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 20px; }
+  .stat { background: #111826; border: 1px solid #1f2937; border-radius: 8px; padding: 10px 14px; min-width: 110px; }
+  .stat .v { font-size: 20px; font-weight: 700; }
+  .stat .k { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: .04em; }
+  .pill { display: inline-block; border: 1px solid #334155; border-radius: 999px; padding: 2px 9px; font-size: 12px; margin-right: 6px; }
+  .waterfall { border: 1px solid #1f2937; border-radius: 10px; overflow: hidden; }
+  .row {
+    display: grid;
+    grid-template-columns: 260px 1fr 70px 80px 180px;
+    grid-template-areas: "label track dur status meta" "io io io io io";
+    align-items: center;
+    gap: 6px 10px;
+    padding: 6px 12px;
+    padding-left: calc(12px + var(--depth) * 18px);
+    border-bottom: 1px solid #141b26;
+    font-size: 12.5px;
+  }
+  .row:nth-child(odd) { background: #0e141c; }
+  .label { grid-area: label; display: flex; align-items: center; gap: 6px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+  .kind { color: #64748b; font-size: 10.5px; text-transform: uppercase; }
+  .track { grid-area: track; position: relative; height: 16px; background: #0a0e14; border-radius: 4px; }
+  .bar { position: absolute; top: 2px; height: 12px; border-radius: 3px; min-width: 2px; opacity: .9; }
+  .bar.error { outline: 1px solid #ef4444; }
+  .bar.running { opacity: .5; background-image: repeating-linear-gradient(45deg, rgba(255,255,255,.25) 0 4px, transparent 4px 8px); }
+  .dur { grid-area: dur; text-align: right; color: #cbd5e1; font-variant-numeric: tabular-nums; }
+  .status { grid-area: status; font-size: 11px; }
+  .status.ok { color: #34d399; }
+  .status.error { color: #f87171; }
+  .status.running { color: #fbbf24; }
+  .meta { grid-area: meta; color: #94a3b8; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .io { grid-area: io; display: none; color: #cbd5e1; font-size: 11.5px; padding: 2px 0 6px; }
+  .row:hover .io { display: block; }
+  .io-row { white-space: pre-wrap; word-break: break-all; margin-top: 2px; }
+  .io code { color: #a7f3d0; }
+  .err { color: #f87171; margin-top: 2px; }
+  footer { margin-top: 18px; color: #475569; font-size: 11px; }
+  footer a { color: #64748b; }
+</style>
+</head>
+<body>
+  <h1>agentlens trace — demo-agent: quarterly-report</h1>
+  <div class="sub">traceId 0847b96a-a101-4a6e-8e61-943123084c95 · started 2026-10-09T22:57:23.583Z</div>
+  <div class="summary">
+    <div class="stat"><div class="v">286ms</div><div class="k">total duration</div></div>
+    <div class="stat"><div class="v">6</div><div class="k">spans</div></div>
+    <div class="stat"><div class="v">222</div><div class="k">tokens</div></div>
+    <div class="stat"><div class="v">$0.00010</div><div class="k">est. cost</div></div>
+    <div class="stat"><div class="v">1</div><div class="k">errors</div></div>
+  </div>
+  <div style="margin-bottom:12px"><span class="pill" style="border-color:#8b5cf6">llm: 1</span> <span class="pill" style="border-color:#f59e0b">agent: 1</span> <span class="pill" style="border-color:#22c55e">tool: 4</span></div>
+  <div class="waterfall">
+    
+      <div class="row" style="--depth:0">
+        <div class="label" title="plan">
+          <span class="dot" style="background:#8b5cf6"></span>
+          <span class="name">plan</span>
+          <span class="kind">llm</span>
+        </div>
+        <div class="track">
+          <div class="bar ok" style="left:0%;width:39.16083916083916%;background:#8b5cf6" title="112ms"></div>
+        </div>
+        <div class="dur">112ms</div>
+        <div class="status ok">ok</div>
+        <div class="meta">180→42 tok · $0.00010 · demo-planner-v1</div>
+        <div class="io">
+          <div class="io-row"><b>in:</b> <code>{&quot;task&quot;:&quot;quarterly-report&quot;}</code></div>
+          <div class="io-row"><b>out:</b> <code>[&quot;search&quot;,&quot;read&quot;,&quot;summarize&quot;]</code></div>
+          
+        </div>
+      </div>
+
+      <div class="row" style="--depth:0">
+        <div class="label" title="agent-run">
+          <span class="dot" style="background:#f59e0b"></span>
+          <span class="name">agent-run</span>
+          <span class="kind">agent</span>
+        </div>
+        <div class="track">
+          <div class="bar ok" style="left:39.16083916083916%;width:60.83916083916085%;background:#f59e0b" title="174ms"></div>
+        </div>
+        <div class="dur">174ms</div>
+        <div class="status ok">ok</div>
+        <div class="meta"></div>
+        <div class="io">
+          
+          
+          
+        </div>
+      </div>
+
+      <div class="row" style="--depth:1">
+        <div class="label" title="search_docs">
+          <span class="dot" style="background:#22c55e"></span>
+          <span class="name">search_docs</span>
+          <span class="kind">tool</span>
+        </div>
+        <div class="track">
+          <div class="bar ok" style="left:39.16083916083916%;width:28.321678321678323%;background:#22c55e" title="81ms"></div>
+        </div>
+        <div class="dur">81ms</div>
+        <div class="status ok">ok</div>
+        <div class="meta"></div>
+        <div class="io">
+          <div class="io-row"><b>in:</b> <code>{&quot;query&quot;:&quot;quarterly-report&quot;}</code></div>
+          <div class="io-row"><b>out:</b> <code>[&quot;doc:quarterly-report#1&quot;,&quot;doc:quarterly-report#2&quot;]</code></div>
+          
+        </div>
+      </div>
+
+      <div class="row" style="--depth:1">
+        <div class="label" title="read_doc">
+          <span class="dot" style="background:#22c55e"></span>
+          <span class="name">read_doc</span>
+          <span class="kind">tool</span>
+        </div>
+        <div class="track">
+          <div class="bar ok" style="left:67.48251748251748%;width:8.391608391608392%;background:#22c55e" title="24ms"></div>
+        </div>
+        <div class="dur">24ms</div>
+        <div class="status ok">ok</div>
+        <div class="meta"></div>
+        <div class="io">
+          <div class="io-row"><b>in:</b> <code>{&quot;id&quot;:&quot;doc:quarterly-report#1&quot;}</code></div>
+          <div class="io-row"><b>out:</b> <code>&quot;contents of doc:quarterly-report#1&quot;</code></div>
+          
+        </div>
+      </div>
+
+      <div class="row" style="--depth:1">
+        <div class="label" title="read_doc">
+          <span class="dot" style="background:#22c55e"></span>
+          <span class="name">read_doc</span>
+          <span class="kind">tool</span>
+        </div>
+        <div class="track">
+          <div class="bar error" style="left:76.22377622377621%;width:15.384615384615385%;background:#22c55e" title="44ms"></div>
+        </div>
+        <div class="dur">44ms</div>
+        <div class="status error">⚠ error</div>
+        <div class="meta"></div>
+        <div class="io">
+          
+          
+          <div class="err">error: fetch failed for doc:quarterly-report#2: upstream 503</div>
+        </div>
+      </div>
+
+      <div class="row" style="--depth:1">
+        <div class="label" title="write_summary">
+          <span class="dot" style="background:#22c55e"></span>
+          <span class="name">write_summary</span>
+          <span class="kind">tool</span>
+        </div>
+        <div class="track">
+          <div class="bar ok" style="left:91.6083916083916%;width:8.391608391608392%;background:#22c55e" title="24ms"></div>
+        </div>
+        <div class="dur">24ms</div>
+        <div class="status ok">ok</div>
+        <div class="meta"></div>
+        <div class="io">
+          <div class="io-row"><b>in:</b> <code>{&quot;parts&quot;:[&quot;contents of doc:quarterly-report#1&quot;,&quot;[skipped doc:quarterly-report#2: fetch failed for doc:quarterly-report#2: upstream 503]&quot;]}</code></div>
+          <div class="io-row"><b>out:</b> <code>&quot;Summary of 2 doc(s): contents of doc:quarterly-report#1 | [skipped doc:quarterly-report#2: fetch failed for doc:quarterly-report#2: upstream 503]&quot;</code></div>
+          
+        </div>
+      </div>
+  </div>
+  <footer>Generated by <a href="https://github.com/edgeorgie/agentlens">agentlens</a> — hover a row to see input/output. Static HTML, no network calls, nothing leaves this file.</footer>
+</body>
+</html>

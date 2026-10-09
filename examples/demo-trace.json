@@ -1,0 +1,116 @@
+{
+  "traceId": "0847b96a-a101-4a6e-8e61-943123084c95",
+  "name": "demo-agent: quarterly-report",
+  "startTime": 1791586643583,
+  "endTime": 1791586643869,
+  "durationMs": 286,
+  "spans": [
+    {
+      "id": "1e295e1a-1e11-4de5-9747-193d1ba6ff48",
+      "parentId": null,
+      "name": "plan",
+      "kind": "llm",
+      "startTime": 1791586643583,
+      "endTime": 1791586643695,
+      "durationMs": 112,
+      "status": "ok",
+      "attributes": {
+        "input": {
+          "task": "quarterly-report"
+        },
+        "output": [
+          "search",
+          "read",
+          "summarize"
+        ],
+        "tokensIn": 180,
+        "tokensOut": 42,
+        "costUsd": 0.0000975,
+        "model": "demo-planner-v1"
+      }
+    },
+    {
+      "id": "7081783c-fd6d-4d1c-93a0-deba22cc6358",
+      "parentId": null,
+      "name": "agent-run",
+      "kind": "agent",
+      "startTime": 1791586643695,
+      "endTime": 1791586643869,
+      "durationMs": 174,
+      "status": "ok",
+      "attributes": {}
+    },
+    {
+      "id": "1093ccc9-9f3b-43af-be37-70ecf04b0ea9",
+      "parentId": "7081783c-fd6d-4d1c-93a0-deba22cc6358",
+      "name": "search_docs",
+      "kind": "tool",
+      "startTime": 1791586643695,
+      "endTime": 1791586643776,
+      "durationMs": 81,
+      "status": "ok",
+      "attributes": {
+        "input": {
+          "query": "quarterly-report"
+        },
+        "output": [
+          "doc:quarterly-report#1",
+          "doc:quarterly-report#2"
+        ]
+      }
+    },
+    {
+      "id": "b5af1924-b281-4cad-8bb9-d35b3ce364be",
+      "parentId": "7081783c-fd6d-4d1c-93a0-deba22cc6358",
+      "name": "read_doc",
+      "kind": "tool",
+      "startTime": 1791586643776,
+      "endTime": 1791586643800,
+      "durationMs": 24,
+      "status": "ok",
+      "attributes": {
+        "input": {
+          "id": "doc:quarterly-report#1"
+        },
+        "output": "contents of doc:quarterly-report#1"
+      }
+    },
+    {
+      "id": "e1974ecc-a29b-4f08-b665-eeec32f9550f",
+      "parentId": "7081783c-fd6d-4d1c-93a0-deba22cc6358",
+      "name": "read_doc",
+      "kind": "tool",
+      "startTime": 1791586643801,
+      "endTime": 1791586643845,
+      "durationMs": 44,
+      "status": "error",
+      "attributes": {
+        "error": "fetch failed for doc:quarterly-report#2: upstream 503"
+      }
+    },
+    {
+      "id": "efcf3592-5f3e-4f97-855d-5d37eb124a30",
+      "parentId": "7081783c-fd6d-4d1c-93a0-deba22cc6358",
+      "name": "write_summary",
+      "kind": "tool",
+      "startTime": 1791586643845,
+      "endTime": 1791586643869,
+      "durationMs": 24,
+      "status": "ok",
+      "attributes": {
+        "input": {
+          "parts": [
+            "contents of doc:quarterly-report#1",
+            "[skipped doc:quarterly-report#2: fetch failed for doc:quarterly-report#2: upstream 503]"
+          ]
+        },
+        "output": "Summary of 2 doc(s): contents of doc:quarterly-report#1 | [skipped doc:quarterly-report#2: fetch failed for doc:quarterly-report#2: upstream 503]"
+      }
+    }
+  ],
+  "totalTokens": 222,
+  "totalCostUsd": 0.0000975,
+  "meta": {
+    "task": "quarterly-report"
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "name": "agentlens",
+  "version": "0.1.0",
+  "description": "Zero-dependency tracing + waterfall visualizer for AI agent tool calls. Instrument any agent loop, export a trace.json, render a self-contained HTML waterfall of every tool call's latency, nesting, tokens and cost.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "agentlens": "./bin/cli.mjs"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.mjs",
+    "demo": "node examples/demo-agent.mjs && node bin/cli.mjs view examples/demo-trace.json -o examples/demo-trace.html"
+  },
+  "keywords": [
+    "ai-agent",
+    "observability",
+    "tracing",
+    "llm",
+    "agent",
+    "waterfall",
+    "mcp"
+  ],
+  "license": "MIT",
+  "author": "edgeorgie",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/edgeorgie/agentlens"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "@types/node": "^22.7.5"
+  }
+}
