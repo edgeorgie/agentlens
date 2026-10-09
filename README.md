@@ -15,10 +15,10 @@ PostHog's own product is "capture all the context agents need to diagnose proble
 ## Install
 
 ```bash
-npm install agentlens
+npm install github:edgeorgie/agentlens
 ```
 
-No dependencies beyond Node's built-in `node:async_hooks` and `node:crypto`. Works in any Node 18+ environment.
+No dependencies beyond Node's built-in `node:async_hooks` and `node:crypto`. Works in any Node 18+ environment. (Not yet on the npm registry under this name — see "npm publish status" below.)
 
 ## Usage
 
@@ -97,3 +97,5 @@ The rendered waterfall ([examples/demo-trace.html](examples/demo-trace.html), al
 ## Repo
 
 MIT licensed. `src/index.ts` (tracer), `src/render.ts` (HTML waterfall renderer), `bin/cli.mjs` (CLI), `public/` (static browser viewer, deployed as-is to Vercel), `examples/demo-agent.mjs` (the real traced demo agent above), `test/` (5 passing node:test cases).
+
+**npm publish status:** not done. Two independent blockers, reported honestly rather than worked around: (1) `npm whoami` returns `ENEEDAUTH` in this environment — no npm credentials, same as `eval-lab`'s unresolved npm-publish gap; (2) separately, the package name `agentlens` is already taken on the npm registry by an unrelated package, so `npm install agentlens` as written above would need a rename (e.g. `@edgeorgie/agentlens`) before a real publish. Installing from GitHub directly works today: `npm install github:edgeorgie/agentlens`.
