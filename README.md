@@ -4,7 +4,7 @@
 
 Most agent demos show you the final answer. **agentlens shows you the path there**: every tool call, every LLM call, how long each took, how they nested, what tokens/cost they burned, and exactly where things failed — rendered as an interactive waterfall, like a browser's network panel but for an agent's reasoning loop.
 
-**Live demo (drop your own trace.json, nothing leaves your browser):** https://agentlens.vercel.app
+**Live demo (drop your own trace.json, nothing leaves your browser):** https://agentlens-nine.vercel.app
 
 This exists to fill a real gap: [triage-desk](https://github.com/edgeorgie/triage-desk), [eval-lab](https://github.com/edgeorgie/eval-lab) and [repoask-mcp](https://github.com/edgeorgie/repoask-mcp) are all retrieval/Q&A or pass-fail-eval shaped. None of them show *how* an agent got to an answer, step by step, with latency/cost broken out per step. agentlens is the observability layer: instrument any agent loop with a few lines, get a trace.json, render it as a real waterfall.
 
@@ -53,7 +53,7 @@ npx agentlens stats trace.json                # print duration/tokens/cost/error
 npx agentlens compare run-a.json run-b.json    # diff two traces, exit 1 if error count regressed
 ```
 
-Or drop the trace.json straight into the [live viewer](https://agentlens.vercel.app) — same renderer, runs fully client-side, nothing uploaded.
+Or drop the trace.json straight into the [live viewer](https://agentlens-nine.vercel.app) — same renderer, runs fully client-side, nothing uploaded.
 
 ## Real, verified output (not a mockup)
 
