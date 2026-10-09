@@ -6,11 +6,16 @@ Most agent demos show you the final answer. **agentlens shows you the path there
 
 **Live demo (drop your own trace.json, nothing leaves your browser):** https://agentlens-nine.vercel.app
 
-This exists to fill a real gap: [triage-desk](https://github.com/edgeorgie/triage-desk), [eval-lab](https://github.com/edgeorgie/eval-lab) and [repoask-mcp](https://github.com/edgeorgie/repoask-mcp) are all retrieval/Q&A or pass-fail-eval shaped. None of them show *how* an agent got to an answer, step by step, with latency/cost broken out per step. agentlens is the observability layer: instrument any agent loop with a few lines, get a trace.json, render it as a real waterfall.
+This exists to fill a real gap: [triage-desk](https://github.com/edgeorgie/triage-desk), [eval-lab](https://github.com/edgeorgie/eval-lab) and [repoask-mcp](https://github.com/edgeorgie/repoask-mcp) are all retrieval/Q&A or pass-fail-eval shaped. None of them show *how* an agent got to an answer, step by step, with latency/cost broken out per step. agentlens is the observability layer: instrument any agent loop with a few lines, get a trace.json, render it as a waterfall.
 
 ## Why this, why now
 
-PostHog's own product is "capture all the context agents need to diagnose problems" — session replay, traces, latency, cost, for products in general. agentlens applies the same idea one layer up: to the agent itself, not just the app it's acting on. This is a minimal, honest v1 of that idea — not a claim to compete with PostHog's actual product — built to demonstrate the capability and the instinct for it.
+I kept wanting this while building the other agent projects: a trace of what an
+agent actually did, not just its final answer. Tracing/observability tools for
+normal web requests are a solved problem (distributed tracing, APM, session
+replay); agent tool-call loops don't usually get the same treatment. agentlens
+is a minimal v1 of that idea, applied one layer up: to the agent's own
+reasoning loop instead of the app it's acting on.
 
 ## Install
 
@@ -55,9 +60,9 @@ npx agentlens compare run-a.json run-b.json    # diff two traces, exit 1 if erro
 
 Or drop the trace.json straight into the [live viewer](https://agentlens-nine.vercel.app) — same renderer, runs fully client-side, nothing uploaded.
 
-## Real, verified output (not a mockup)
+## Verified output
 
-`npm run demo` runs a small but genuine multi-step agent (plan → search_docs → read_doc ×2 → write_summary, one read deliberately fails to show error handling) fully instrumented with agentlens, and renders it. Actual output from a real run:
+`npm run demo` runs a small multi-step agent (plan → search_docs → read_doc ×2 → write_summary, one read deliberately fails to show error handling) fully instrumented with agentlens, and renders it. Output from a run:
 
 ```
 agent result: Summary of 2 doc(s): contents of doc:quarterly-report#1 | [skipped doc:quarterly-report#2: fetch failed for doc:quarterly-report#2: upstream 503]
@@ -84,9 +89,9 @@ The rendered waterfall ([examples/demo-trace.html](examples/demo-trace.html), al
 ## Design choices, stated plainly
 
 - **Zero runtime dependencies.** No OpenTelemetry SDK, no vendor lock-in, no server required. A trace is just JSON; the renderer is a single HTML file.
-- **Cost/tokens are optional fields you set yourself** (`setAttrs({ tokensIn, tokensOut, costUsd, model })`) — agentlens doesn't call any LLM API or know your provider's pricing; it just sums whatever you report. This keeps the library itself at exactly $0 marginal cost — the demo above uses a stubbed "planner" with fabricated-but-labeled-as-demo token counts, specifically so `npm run demo` never spends a cent or needs an API key.
-- **Not OpenTelemetry-compatible (yet).** This is a minimal, dependency-free v1 built in one session to prove the capability — not a claim to replace OTel. A real next step (documented, not built) would be an OTel exporter so traces can also land in an existing observability backend.
-- **Nesting via `AsyncLocalStorage`**, not manual span-id threading — the ergonomics PostHog's own SDKs use for request context, applied here to agent tool-call context.
+- **Cost/tokens are optional fields you set yourself** (`setAttrs({ tokensIn, tokensOut, costUsd, model })`) — agentlens doesn't call any LLM API or know your provider's pricing; it just sums whatever you report. This keeps the library itself at exactly $0 marginal cost — the demo above uses a stubbed "planner" with made-up, labeled-as-demo token counts, specifically so `npm run demo` never spends a cent or needs an API key.
+- **Not OpenTelemetry-compatible (yet).** This is a minimal, dependency-free v1 — not a claim to replace OTel. A next step (documented, not built) would be an OTel exporter so traces can also land in an existing observability backend.
+- **Nesting via `AsyncLocalStorage`**, not manual span-id threading.
 
 ## What I'd build next (honest scope line)
 
@@ -98,4 +103,4 @@ The rendered waterfall ([examples/demo-trace.html](examples/demo-trace.html), al
 
 MIT licensed. `src/index.ts` (tracer), `src/render.ts` (HTML waterfall renderer), `bin/cli.mjs` (CLI), `public/` (static browser viewer, deployed as-is to Vercel), `examples/demo-agent.mjs` (the real traced demo agent above), `test/` (5 passing node:test cases).
 
-**npm publish status:** not done. Two independent blockers, reported honestly rather than worked around: (1) `npm whoami` returns `ENEEDAUTH` in this environment — no npm credentials, same as `eval-lab`'s unresolved npm-publish gap; (2) separately, the package name `agentlens` is already taken on the npm registry by an unrelated package, so `npm install agentlens` as written above would need a rename (e.g. `@edgeorgie/agentlens`) before a real publish. Installing from GitHub directly works today: `npm install github:edgeorgie/agentlens`.
+**npm publish status:** not done. Two independent blockers: (1) `npm whoami` returns `ENEEDAUTH` in this environment — no npm credentials, same as `eval-lab`'s unresolved npm-publish gap; (2) separately, the package name `agentlens` is already taken on the npm registry by an unrelated package, so `npm install agentlens` as written above would need a rename (e.g. `@edgeorgie/agentlens`) before a publish. Installing from GitHub directly works today: `npm install github:edgeorgie/agentlens`.
