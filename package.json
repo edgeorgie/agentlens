@@ -15,6 +15,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "pretest": "npm run build",
     "test": "node --test test/*.test.mjs",
     "demo": "node examples/demo-agent.mjs && node bin/cli.mjs view examples/demo-trace.json -o examples/demo-trace.html"
   },

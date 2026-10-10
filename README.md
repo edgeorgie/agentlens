@@ -84,7 +84,9 @@ agentlens stats — demo-agent: quarterly-report
 
 The rendered waterfall ([examples/demo-trace.html](examples/demo-trace.html), also loadable via "Load example trace" on the live viewer) shows the `plan` LLM span, the `agent-run` span containing 4 nested tool spans, the failed `read_doc` call outlined in red, and hover-to-see input/output/error on every row.
 
-5/5 unit tests pass locally (`npm test`): nested span parent/child correctness, concurrent-sibling isolation (two tool calls in `Promise.all` don't cross-contaminate each other's parent context), error capture without losing the trace, token/cost summation, and HTML self-containment (no external network calls baked into the rendered file).
+5/5 unit tests pass locally (`npm test`, which runs a `pretest` hook invoking
+`npm run build` first — so `npm install && npm test` works on a fresh clone
+with no manual build step): nested span parent/child correctness, concurrent-sibling isolation (two tool calls in `Promise.all` don't cross-contaminate each other's parent context), error capture without losing the trace, token/cost summation, and HTML self-containment (no external network calls baked into the rendered file).
 
 ## Design choices, stated plainly
 
