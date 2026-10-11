@@ -84,9 +84,9 @@ agentlens stats — demo-agent: quarterly-report
 
 The rendered waterfall ([examples/demo-trace.html](examples/demo-trace.html), also loadable via "Load example trace" on the live viewer) shows the `plan` LLM span, the `agent-run` span containing 4 nested tool spans, the failed `read_doc` call outlined in red, and hover-to-see input/output/error on every row.
 
-5/5 unit tests pass locally (`npm test`, which runs a `pretest` hook invoking
+7/7 unit tests pass locally (`npm test`, which runs a `pretest` hook invoking
 `npm run build` first — so `npm install && npm test` works on a fresh clone
-with no manual build step): nested span parent/child correctness, concurrent-sibling isolation (two tool calls in `Promise.all` don't cross-contaminate each other's parent context), error capture without losing the trace, token/cost summation, and HTML self-containment (no external network calls baked into the rendered file).
+with no manual build step): nested span parent/child correctness, concurrent-sibling isolation (two tool calls in `Promise.all` don't cross-contaminate each other's parent context), error capture without losing the trace, token/cost summation, HTML self-containment (no external network calls baked into the rendered file), and two viewer checks: `public/analytics.js` is a complete no-op without a key, and with one it loads the SDK from `/ingest` and flushes queued events after init.
 
 ## Design choices, stated plainly
 
@@ -101,8 +101,17 @@ with no manual build step): nested span parent/child correctness, concurrent-sib
 - A live/streaming mode (spans pushed to the viewer as they happen, not just post-hoc JSON).
 - Real LLM-call auto-instrumentation wrappers for the Anthropic/OpenAI SDKs (today you set tokens/cost yourself after the call).
 
+## Viewer analytics
+
+The live viewer can report product analytics to PostHog. The tracer library and the CLI never do: a library embedded in someone else's agent must never phone home. The viewer's analytics are off until a key is configured, so a fork, a local copy or this repo as checked in sends nothing.
+
+- **What is sent, in full:** a `$pageview` and one `trace_loaded` event per rendered trace, with `source` (`example` or `upload`) and `span_bucket` (`<10`, `10-50`, `50-200`, `200+`), plus the super properties `app: "agentlens"` and `surface: "web"`. Never span names, inputs, outputs, errors, models, file names or anything else from a trace. The trace itself still never leaves the browser.
+- **How:** cookieless (`cookieless_mode: "always"`, `person_profiles: "never"`, no `identify()`), no autocapture, no session replay, Do Not Track honoured. Requests go to `/ingest/*` on this origin, which `vercel.json` rewrites to PostHog, so a tracking blocker that filters by domain does not drop them and a CSP can stay at `'self'`. The SDK is downloaded only when a key exists. Turn on "Discard client IP data" in the PostHog project settings; the SDK's `ip` option is deprecated and has no effect.
+- **Enable:** put the PostHog project token in `public/analytics-config.js` (`window.AGENTLENS_POSTHOG_KEY = "phc_…";`) and deploy. The token is public by design; there is no build step and no environment variable.
+- **Disable:** set it back to `""`. With an empty key `public/analytics.js` injects nothing, requests nothing and logs nothing; `test/viewer-analytics.test.mjs` checks that.
+
 ## Repo
 
-MIT licensed. `src/index.ts` (tracer), `src/render.ts` (HTML waterfall renderer), `bin/cli.mjs` (CLI), `public/` (static browser viewer, deployed as-is to Vercel), `examples/demo-agent.mjs` (the real traced demo agent above), `test/` (5 passing node:test cases).
+MIT licensed. `src/index.ts` (tracer), `src/render.ts` (HTML waterfall renderer), `bin/cli.mjs` (CLI), `public/` (static browser viewer, deployed as-is to Vercel), `examples/demo-agent.mjs` (the real traced demo agent above), `test/` (7 passing node:test cases).
 
 **npm publish status:** not done. Two independent blockers: (1) `npm whoami` returns `ENEEDAUTH` in this environment — no npm credentials, same as `eval-lab`'s unresolved npm-publish gap; (2) separately, the package name `agentlens` is already taken on the npm registry by an unrelated package, so `npm install agentlens` as written above would need a rename (e.g. `@edgeorgie/agentlens`) before a publish. Installing from GitHub directly works today: `npm install github:edgeorgie/agentlens`.

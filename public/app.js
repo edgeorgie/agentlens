@@ -100,12 +100,28 @@ function renderTrace(trace) {
   `;
 }
 
+// Coarse size of a trace, so no exact count can single out a visitor. This is
+// the only thing the viewer reports about a trace: span names, inputs, outputs,
+// errors, models and file names never leave the browser.
+function spanBucket(count) {
+  if (count < 10) return "<10";
+  if (count < 50) return "10-50";
+  if (count < 200) return "50-200";
+  return "200+";
+}
+
+function reportTraceLoaded(trace, source) {
+  if (typeof window.agentlensTrack !== "function") return;
+  window.agentlensTrack("trace_loaded", { source, span_bucket: spanBucket(trace.spans.length) });
+}
+
 function handleFile(file) {
   const reader = new FileReader();
   reader.onload = () => {
     try {
       const trace = JSON.parse(reader.result);
       renderTrace(trace);
+      reportTraceLoaded(trace, "upload");
     } catch (e) {
       document.getElementById("result").innerHTML = `<div style="color:#f87171">Could not parse trace.json: ${esc(e.message)}</div>`;
     }
@@ -117,6 +133,7 @@ async function loadDemo() {
   const res = await fetch("demo-trace.json");
   const trace = await res.json();
   renderTrace(trace);
+  reportTraceLoaded(trace, "example");
 }
 
 const drop = document.getElementById("drop");
