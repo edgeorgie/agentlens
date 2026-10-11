@@ -6,7 +6,11 @@
 //   injected, no request is made, nothing is logged.
 // - With a key the SDK is fetched from this origin (/ingest/static/array.js,
 //   rewritten to PostHog by vercel.json), so tracking blockers that filter by
-//   domain do not drop it and a CSP can stay at 'self'.
+//   domain do not drop it and a CSP can stay at 'self'. The rewrites live in
+//   vercel.json only while a key is set (see README, "Viewer analytics"): a
+//   rewrite is a server-side route that exists whether or not anything calls
+//   it, so an unconditional one would relay whatever is posted to /ingest/* to
+//   PostHog. test/viewer-analytics.test.mjs keeps the two files in step.
 // - Cookieless, no person profiles, no autocapture, no session replay: the
 //   only events are the explicit ones app.js sends through agentlensTrack(),
 //   and they never carry anything from a trace.

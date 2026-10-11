@@ -63,3 +63,30 @@ test("viewer analytics with a key loads the SDK from this origin and flushes que
   assert.deepEqual(captureCall, ["capture", "trace_loaded", { source: "example", span_bucket: "<10" }]);
   assert.equal(logged.length, 0);
 });
+
+// The proxy is a server-side route, so it exists whether or not the viewer ever
+// calls it: with the rules in vercel.json and no key, the deployment would relay
+// whatever is posted to /ingest/* to PostHog's public ingestion API. This site
+// has no build step to switch the rules on, so the checked-in key and the
+// checked-in rules must agree. Reading both files is the only check there is.
+const configKey = (() => {
+  const text = readFileSync(new URL("../public/analytics-config.js", import.meta.url), "utf8");
+  const match = text.match(/^window\.AGENTLENS_POSTHOG_KEY\s*=\s*"([^"]*)";/m);
+  assert.ok(match, "analytics-config.js must assign window.AGENTLENS_POSTHOG_KEY a string literal");
+  return match[1].trim();
+})();
+const rewrites = JSON.parse(readFileSync(new URL("../vercel.json", import.meta.url), "utf8")).rewrites ?? [];
+
+test("vercel.json registers no /ingest route while the key is empty", () => {
+  if (configKey) return;
+  assert.deepEqual(rewrites, []);
+});
+
+test("vercel.json proxies /ingest to PostHog's own hosts, and only while a key is set", () => {
+  if (!configKey) return;
+  assert.deepEqual(
+    rewrites.map((r) => r.source),
+    ["/ingest/static/:path*", "/ingest/array/:path*", "/ingest/:path*"],
+  );
+  for (const r of rewrites) assert.match(new URL(r.destination).hostname, /\.i\.posthog\.com$/);
+});
