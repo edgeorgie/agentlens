@@ -9,6 +9,11 @@ on:
   # not tied to someone pushing code.
   schedule:
     - cron: "17 6 * * *"
+  # Fires the moment someone changes branch protection, instead of up to 24h
+  # later on the next scheduled run. The window between a bad settings change
+  # and its detection is the window in which `main` is silently wedged.
+  branch_protection_rule:
+    types: [created, edited, deleted]
   workflow_dispatch:
 
 # Pinned explicitly so a change to the repository-level default cannot
@@ -116,6 +121,10 @@ jobs:
       # granted, so the live state was unreadable from a workflow until `main`
       # was migrated to a ruleset.
       contents: read
+      # For the failure issue below. Without it nothing surfaces a red
+      # scheduled run except a notification email to whoever last touched the
+      # cron — which is nobody, for a workflow that runs unattended.
+      issues: write
     steps:
       - uses: actions/checkout@v7
       # No `npm ci`: the script imports only node: builtins and uses global
@@ -124,7 +133,48 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-      - run: node scripts/check-live-protection.mjs
+      - id: check
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # `set -o pipefail` is load-bearing, not boilerplate: without it the
+        # pipeline's exit code is `tee`'s, which is always 0, so a failing check
+        # would report SUCCESS and the `failure()` step below would never run.
+        # Verified: `false | tee x` exits 0 under bash's default settings.
+        run: |
+          set -o pipefail
+          node scripts/check-live-protection.mjs 2>&1 | tee drift.log
+      # Because this job is NOT a required status check, a red run blocks
+      # nothing and would otherwise be seen by nobody. One deduplicated issue
+      # is the notification path: reopened and commented if it already exists,
+      # so a persistent problem does not spawn an issue per day.
+      - if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: "Branch protection on `main` has drifted from ci.yml"
+        run: |
+          body=$'The scheduled `protection-drift` check failed. `main`\'s live ruleset no longer matches the status checks `ci.yml` produces, which can leave the branch unmergeable or unguarded.\n\nRun: '"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"$'\n\n```\n'"$(cat drift.log)"$'\n```'
+          existing=$(gh issue list --state all --search "$TITLE in:title" \
+            --json number,state --jq '.[0] | select(.) | "\(.number) \(.state)"')
+          if [ -n "$existing" ]; then
+            num=${existing%% *}
+            state=${existing##* }
+            [ "$state" = "CLOSED" ] && gh issue reopen "$num"
+            gh issue comment "$num" --body "$body"
+          else
+            gh issue create --title "$TITLE" --body "$body"
+          fi
+      # Closes the issue once the drift is gone, so a stale open issue does not
+      # become the new thing nobody trusts.
+      - if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: "Branch protection on `main` has drifted from ci.yml"
+        run: |
+          num=$(gh issue list --state open --search "$TITLE in:title" \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$num" ]; then
+            gh issue comment "$num" --body "Drift resolved: the live ruleset now matches \`ci.yml\`. Closing."
+            gh issue close "$num"
+          fi
+
 

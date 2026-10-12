@@ -9,14 +9,17 @@ import { readFileSync } from "node:fs";
 // This module is the single place that derives those names from `ci.yml`. Two
 // consumers import it: the unit test (which compares against the committed
 // mirror) and `check-live-protection.mjs` (which compares against the live
-// ruleset). A second hand-written copy of this parser would be one more thing
-// to drift, which is the defect class being fixed — so there is exactly one.
+// ruleset).
 
 const WORKFLOW_PATH = new URL("../.github/workflows/ci.yml", import.meta.url);
 const MIRROR_PATH = new URL(
   "../.github/required-status-checks.txt",
   import.meta.url,
 );
+
+// The only matrix key this module knows how to expand. Anything else under
+// `matrix:` makes the derived set wrong, so it is rejected, not ignored.
+const SUPPORTED_MATRIX_KEYS = new Set(["node"]);
 
 /**
  * Reads the committed list of required status-check context names.
@@ -35,66 +38,107 @@ export function readMirroredContexts() {
 }
 
 /**
+ * Extracts a block-mapping key's lines by indentation: the following lines
+ * indented deeper than the key, stopping at the first indented the same or
+ * less. Blank and comment-only lines do not terminate a block.
+ *
+ * @param {string[]} lines source lines
+ * @param {RegExp} keyPattern anchored pattern matching the key's own line
+ * @param {string} description what was looked for, for the error message
+ * @returns {{indent: number, body: string[]}}
+ * @throws {Error} if the key is not found
+ */
+function extractBlock(lines, keyPattern, description) {
+  const startIndex = lines.findIndex((line) => keyPattern.test(line));
+  if (startIndex === -1) {
+    throw new Error(
+      `could not find ${description} in ci.yml — the workflow shape changed ` +
+        "and this guard's parser needs updating",
+    );
+  }
+  const header = lines[startIndex];
+  const indent = header.length - header.trimStart().length;
+
+  const body = [];
+  for (const line of lines.slice(startIndex + 1)) {
+    if (line.trim().length === 0 || line.trimStart().startsWith("#")) {
+      body.push(line);
+      continue;
+    }
+    if (line.length - line.trimStart().length <= indent) break;
+    body.push(line);
+  }
+  return { indent, body };
+}
+
+/**
+ * Lists every key defined directly under the `matrix:` block, with its value
+ * lines.
+ *
+ * This is what makes the guard ordering-independent, and it exists because the
+ * previous implementation was not. That version searched for
+ * `exclude:`/`include:` only in the text FOLLOWING the `node:` line, so moving
+ * the identical stanza above `node:` bypassed it completely: the guard derived
+ * [Node 20, Node 22, Node 24] and exited 0 while GitHub produced only
+ * [Node 20, Node 24], leaving `main` wedged on a required context no run
+ * reports. YAML mappings are unordered — a check that depends on where a
+ * sibling key sits in the text is not a check.
+ *
+ * @param {string[]} matrixBody lines inside the `matrix:` block
+ * @param {number} matrixIndent indentation of the `matrix:` key itself
+ * @returns {Map<string, string[]>} key -> its value lines
+ */
+function readMatrixKeys(matrixBody, matrixIndent) {
+  const keys = new Map();
+  let current = null;
+
+  for (const line of matrixBody) {
+    if (line.trim().length === 0 || line.trimStart().startsWith("#")) continue;
+    const indent = line.length - line.trimStart().length;
+
+    const keyMatch = line.match(/^\s*([A-Za-z_][\w-]*)\s*:(.*)$/);
+    if (keyMatch && indent === matrixIndent + 2) {
+      current = keyMatch[1];
+      keys.set(current, [keyMatch[2]]);
+      continue;
+    }
+    // Deeper lines are part of the current key's value — e.g. the `- node: 22`
+    // items of a block sequence.
+    if (current) keys.get(current).push(line);
+  }
+  return keys;
+}
+
+/**
  * Derives the status-check context names the CI workflow produces, by reading
  * the workflow definition rather than restating it.
  *
- * Deliberately a narrow parser over this repo's one workflow shape — a single
- * matrix job keyed on `node`, named `Node ${{ matrix.node }}` — instead of a
- * YAML dependency. The parser is strict about that shape and throws when it no
- * longer holds, because a parser that silently returns `[]` on an unrecognised
- * workflow would let the assertion pass vacuously, which is the exact failure
- * this guard exists to prevent.
+ * Narrow by design: it understands one matrix job keyed solely on `node`, named
+ * `Node ${{ matrix.node }}`. Anything outside that shape throws, because a
+ * parser that returned a stale or empty set on an unrecognised workflow would
+ * let the assertion pass vacuously — the exact failure this guard exists to
+ * prevent, and the one it has already failed at twice.
  *
  * @returns {string[]} expanded context names, in matrix order
  * @throws {Error} if the workflow no longer matches the expected shape
  */
 export function deriveContextsFromWorkflow() {
-  const yaml = readFileSync(WORKFLOW_PATH, "utf8");
+  const lines = readFileSync(WORKFLOW_PATH, "utf8").split("\n");
 
-  // Scoped to the `test:` job's block, NOT the first 4-space `name:` in the
-  // file. ci.yml has more than one job, and a bare first-match would silently
-  // read whichever job happens to appear first in the source — so merely
-  // REORDERING the jobs would change the derived context names and this
-  // guard's verdict. Slicing to the block makes the dependency on job identity
-  // explicit instead of implicit in file order.
-  const JOB = "  test:\n";
-  const jobStart = yaml.indexOf(JOB);
-  if (jobStart === -1) {
-    throw new Error(
-      "could not find a `test:` job in ci.yml — the matrix job was renamed " +
-        "or removed and this guard's parser needs updating",
-    );
-  }
-  const afterJobStart = yaml.slice(jobStart + JOB.length);
-  // The job's block ends at the next job (a 2-space-indented key) or EOF.
-  const nextJob = afterJobStart.search(/^ {2}\S/m);
-  const jobBlock =
-    nextJob === -1 ? afterJobStart : afterJobStart.slice(0, nextJob);
+  // Scoped to the `test:` job, not the first 4-space `name:` in the file:
+  // ci.yml has more than one job, so a bare first-match would read whichever
+  // appears first in the source, making mere job reordering change the result.
+  const job = extractBlock(lines, /^ {2}test:\s*$/, "a `test:` job");
 
-  const nameMatch = jobBlock.match(/^\s{4}name:\s*(.+?)\s*$/m);
-  if (!nameMatch) {
+  const nameLine = job.body.find((line) => /^ {4}name:\s*\S/.test(line));
+  if (!nameLine) {
     throw new Error(
       "could not find a job-level `name:` in ci.yml's `test:` job — the " +
         "workflow shape changed and this guard's parser needs updating",
     );
   }
-  const nameTemplate = nameMatch[1];
+  const nameTemplate = nameLine.replace(/^\s*name:\s*/, "").trim();
 
-  const matrixMatch = jobBlock.match(/^\s*node:\s*\[([^\]]+)\]\s*$/m);
-  if (!matrixMatch) {
-    throw new Error(
-      "could not find a `node: [...]` matrix in ci.yml — the workflow shape " +
-        "changed and this guard's parser needs updating",
-    );
-  }
-  const versions = matrixMatch[1]
-    .split(",")
-    .map((v) => v.trim())
-    .filter((v) => v.length > 0);
-
-  if (versions.length === 0) {
-    throw new Error("parsed an empty `node:` matrix from ci.yml");
-  }
   if (!nameTemplate.includes("${{ matrix.node }}")) {
     throw new Error(
       `job name ${JSON.stringify(nameTemplate)} does not interpolate ` +
@@ -103,58 +147,57 @@ export function deriveContextsFromWorkflow() {
     );
   }
 
-  // GitHub can change the SET of contexts without changing the `node:` line at
-  // all, and those are the dangerous edits because this parser reads values,
-  // not shape:
-  //
-  //   - `exclude:` removes a combination, so a listed version produces NO
-  //     context. Protection keeps requiring it and `main` wedges — the exact
-  //     #13 deadlock, straight through the guard meant to prevent it.
-  //   - `include:` adds a combination, so an unlisted context appears.
-  //   - a second matrix key (`os:`, `ts:`) multiplies every context name.
-  //
-  // Each is detected and throws, rather than being modelled. Modelling the
-  // full matrix-expansion algorithm in a regex parser would be its own source
-  // of silent wrongness; refusing to guess is the honest behaviour, and the
-  // error says exactly what to do.
-  // Sliced from `jobBlock`, not the whole file: with more than one job in
-  // ci.yml, `indexOf("\n    steps:")` over the full source could land on
-  // ANOTHER job's `steps:` and stretch this window across a job boundary,
-  // making the stanza detection below read lines that are not part of this
-  // matrix at all.
-  const matrixBlock = jobBlock.slice(
-    jobBlock.indexOf(matrixMatch[0]) + matrixMatch[0].length,
+  const matrix = extractBlock(
+    job.body,
+    /^ {6}matrix:\s*$/,
+    "a `matrix:` block in the `test:` job",
   );
-  const stepsIndex = matrixBlock.indexOf("\n    steps:");
-  if (stepsIndex === -1) {
+  const matrixKeys = readMatrixKeys(matrix.body, matrix.indent);
+
+  // Fail closed on ANY key that is not `node`, in any position or style.
+  // `exclude:` removes a combination so a listed version produces no context;
+  // `include:` adds an unlisted one; a second dimension (`os:`, `ts:`)
+  // multiplies every name. Each silently invalidates the derived set, and
+  // hand-modelling GitHub's expansion would be its own source of wrongness.
+  const unsupported = [...matrixKeys.keys()].filter(
+    (key) => !SUPPORTED_MATRIX_KEYS.has(key),
+  );
+  if (unsupported.length > 0) {
     throw new Error(
-      "could not find the `test:` job's `steps:` after its matrix in ci.yml " +
-        "— the workflow shape changed and this guard's parser needs updating",
+      `ci.yml's matrix defines ${unsupported.map((k) => `\`${k}:\``).join(", ")}, ` +
+        "which this guard cannot expand. Those keys change which contexts are " +
+        "produced without changing the `node:` list, so the derived set would " +
+        "be wrong while this check reported green — wedging `main` on a " +
+        "context no run can report. Teach this guard the expansion, or drop " +
+        "the key.",
     );
   }
-  const afterMatrix = matrixBlock.slice(0, stepsIndex);
 
-  for (const stanza of ["include", "exclude"]) {
-    if (new RegExp(`^\\s+${stanza}:`, "m").test(afterMatrix)) {
-      throw new Error(
-        `ci.yml's matrix now uses an \`${stanza}:\` stanza, which changes ` +
-          "which contexts are produced without changing the `node:` list. " +
-          "This parser reads the `node:` list only, so it can no longer " +
-          "derive the real context set — it would pass while protection " +
-          "requires a context no run produces (or misses a new one). Update " +
-          "this guard to model the expansion, or drop the stanza.",
-      );
-    }
+  const nodeValue = matrixKeys.get("node");
+  if (!nodeValue) {
+    throw new Error(
+      "ci.yml's matrix has no `node:` key — the workflow shape changed and " +
+        "this guard's parser needs updating",
+    );
   }
 
-  const extraKey = afterMatrix.match(/^\s+([a-zA-Z_][\w-]*):\s*\[/m);
-  if (extraKey) {
+  // Flow sequence only (`node: [20, 22, 24]`). A block sequence needs
+  // different parsing, so it is rejected rather than mis-read.
+  const flow = nodeValue.join(" ").match(/^\s*\[([^\]]*)\]\s*$/);
+  if (!flow) {
     throw new Error(
-      `ci.yml's matrix has a second dimension \`${extraKey[1]}:\`, so each ` +
-        "context name is a combination of more than one matrix value. This " +
-        "parser expands `node:` alone and would derive the wrong context " +
-        "set. Update this guard to model the extra dimension.",
+      "ci.yml's `node:` matrix is not a flow sequence (`node: [20, 22]`). " +
+        "This guard reads only that form; convert it back, or teach the guard " +
+        "the other form — it must not guess at the values.",
     );
+  }
+  const versions = flow[1]
+    .split(",")
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0);
+
+  if (versions.length === 0) {
+    throw new Error("parsed an empty `node:` matrix from ci.yml");
   }
 
   return versions.map((v) => nameTemplate.replaceAll("${{ matrix.node }}", v));
