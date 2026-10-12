@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { parse as parseYaml } from "yaml";
 
 // Branch protection on `main` requires a list of literal status-check CONTEXT
 // names. For a matrix job, a context name is `<job name template, expanded>`.
@@ -10,6 +11,53 @@ import { readFileSync } from "node:fs";
 // consumers import it: the unit test (which compares against the committed
 // mirror) and `check-live-protection.mjs` (which compares against the live
 // ruleset).
+//
+// ---------------------------------------------------------------------------
+// WHY THIS PARSES YAML INSTEAD OF SCANNING LINES
+// ---------------------------------------------------------------------------
+//
+// Five earlier versions of this file derived the matrix by scanning ci.yml line
+// by line with indentation and regex heuristics. Each was bypassed, and each
+// fix closed only the one spelling that had just been demonstrated:
+//
+//   #13  protection required a context the matrix no longer produced
+//   #15  `exclude:` searched only in the text after `node:`
+//   #16  the same stanza moved ABOVE `node:` walked straight through
+//   #17  `'exclude':` (quoted) above `node:` was silently discarded, because
+//        the key regex was anchored to [A-Za-z_] and the non-matching line
+//        fell into an `if (current)` branch that dropped it on the floor
+//
+// The through-line is not that the regexes were too narrow. It is that a line
+// scanner models TEXT, while GitHub acts on the PARSED DOCUMENT. Every bypass
+// was a pair of files that differ as text and are identical as YAML. The
+// decisive case is a merge key:
+//
+//     x-extra: &extra
+//       exclude:
+//         - node: 22
+//     ...
+//           matrix:
+//             <<: *extra
+//             node: [20, 22, 24]
+//
+// `jobs.test.strategy.matrix` here really contains `exclude`, and GitHub drops
+// Node 22 — but the token `exclude` never appears anywhere under `matrix:`. No
+// regex over lines can see a key that is not in the lines. That is a proof, not
+// an anecdote: the heuristic approach cannot be made correct, only narrower.
+//
+// So this module parses the workflow with a real YAML parser and reads
+// `jobs.test.strategy.matrix` off the resulting object. Quoting, key order,
+// flow vs block style, explicit `? key` form, anchors, aliases, merge keys,
+// block scalars and non-ASCII lookalike characters all stop being special
+// cases: either the parser resolves them to the key `node` and nothing else, or
+// this module throws. `test/ci-contexts-mutations.test.mjs` applies every one of
+// those mutation classes, in both placements relative to `node:`, and asserts
+// each one fails closed.
+//
+// The cost is one devDependency (`yaml`, zero transitive runtime deps). It is
+// not a dependency of the published package: `package.json#files` ships only
+// `dist/`, `bin/` and `README.md`, and `dependencies` stays empty. The price of
+// avoiding it was six bypasses.
 
 const WORKFLOW_PATH = new URL("../.github/workflows/ci.yml", import.meta.url);
 const MIRROR_PATH = new URL(
@@ -17,8 +65,14 @@ const MIRROR_PATH = new URL(
   import.meta.url,
 );
 
+// The id of the job whose contexts are the merge gate.
+const GATED_JOB_ID = "test";
+
 // The only matrix key this module knows how to expand. Anything else under
 // `matrix:` makes the derived set wrong, so it is rejected, not ignored.
+// `include:`/`exclude:` change which jobs run without changing this list, and a
+// second dimension multiplies (and can collide) every name — both are verified
+// behaviours, see the mutation test.
 const SUPPORTED_MATRIX_KEYS = new Set(["node"]);
 
 /**
@@ -38,167 +92,372 @@ export function readMirroredContexts() {
 }
 
 /**
- * Extracts a block-mapping key's lines by indentation: the following lines
- * indented deeper than the key, stopping at the first indented the same or
- * less. Blank and comment-only lines do not terminate a block.
+ * Parses workflow YAML into a plain object.
  *
- * @param {string[]} lines source lines
- * @param {RegExp} keyPattern anchored pattern matching the key's own line
- * @param {string} description what was looked for, for the error message
- * @returns {{indent: number, body: string[]}}
- * @throws {Error} if the key is not found
+ * `merge: true` resolves `<<:` merge keys, so a key injected through an anchor
+ * is present in the result exactly as GitHub sees it — this is the setting that
+ * makes the merge-key bypass visible rather than invisible. Verified against
+ * `yaml@2`: without it, `<<` is returned as a literal key and the merged
+ * content never appears.
+ *
+ * `uniqueKeys: true` makes a duplicate mapping key a parse error instead of a
+ * silent last-wins overwrite. The old line scanner overwrote silently, which is
+ * one more place it diverged from the document GitHub reads.
+ *
+ * @param {string} source workflow YAML
+ * @returns {object} the parsed workflow document
+ * @throws {Error} if the source is not valid YAML or not a mapping
  */
-function extractBlock(lines, keyPattern, description) {
-  const startIndex = lines.findIndex((line) => keyPattern.test(line));
-  if (startIndex === -1) {
+function parseWorkflow(source) {
+  let doc;
+  try {
+    doc = parseYaml(source, { merge: true, uniqueKeys: true });
+  } catch (error) {
     throw new Error(
-      `could not find ${description} in ci.yml — the workflow shape changed ` +
-        "and this guard's parser needs updating",
+      `ci.yml is not valid YAML, so the contexts it produces cannot be ` +
+        `derived: ${error.message}`,
     );
   }
-  const header = lines[startIndex];
-  const indent = header.length - header.trimStart().length;
-
-  const body = [];
-  for (const line of lines.slice(startIndex + 1)) {
-    if (line.trim().length === 0 || line.trimStart().startsWith("#")) {
-      body.push(line);
-      continue;
-    }
-    if (line.length - line.trimStart().length <= indent) break;
-    body.push(line);
+  if (doc === null || typeof doc !== "object" || Array.isArray(doc)) {
+    throw new Error(
+      `ci.yml did not parse to a mapping (got ${Array.isArray(doc) ? "a sequence" : typeof doc}), ` +
+        "so it is not a workflow this guard can read",
+    );
   }
-  return { indent, body };
+  return doc;
 }
 
 /**
- * Lists every key defined directly under the `matrix:` block, with its value
- * lines.
+ * Renders one matrix value the way GitHub renders it into a job name.
  *
- * This is what makes the guard ordering-independent, and it exists because the
- * previous implementation was not. That version searched for
- * `exclude:`/`include:` only in the text FOLLOWING the `node:` line, so moving
- * the identical stanza above `node:` bypassed it completely: the guard derived
- * [Node 20, Node 22, Node 24] and exited 0 while GitHub produced only
- * [Node 20, Node 24], leaving `main` wedged on a required context no run
- * reports. YAML mappings are unordered — a check that depends on where a
- * sibling key sits in the text is not a check.
+ * GitHub interpolates the value's string form, so the YAML scalar TYPE does not
+ * reach the context name: `node: [20]` and `node: ["20"]` both produce
+ * `Node 20`. Confirmed empirically, not assumed — a probe workflow with
+ * `name: Node ${{ matrix.node }}` over `[20, 24]` and
+ * `name: NodeQ ${{ matrix.node }}` over `["20", "24"]` reported
+ * `Node 20 / Node 24` and `NodeQ 20 / NodeQ 24`
+ * (edgeorgie/qa-injection-test-repo run 38235526774; the same four names appear
+ * in `GET /commits/{sha}/check-runs`, which is what branch protection matches
+ * against). The same run also pinned the edge cases this function must not get
+ * wrong: bare `20.0` renders as `20`, the quoted string `"20.0"` renders as
+ * `20.0`, `0o20` renders as `16`, and `true` renders as `true` — all four
+ * identical to `String()` on the parsed JS value.
  *
- * @param {string[]} matrixBody lines inside the `matrix:` block
- * @param {number} matrixIndent indentation of the `matrix:` key itself
- * @returns {Map<string, string[]>} key -> its value lines
+ * Only scalars are accepted. A mapping or sequence as a matrix value renders as
+ * an object GitHub stringifies in a shape this module does not model, so it
+ * throws rather than guessing.
+ *
+ * @param {unknown} value one entry of the `node:` list
+ * @returns {string}
+ * @throws {Error} if the value is not a scalar
  */
-function readMatrixKeys(matrixBody, matrixIndent) {
-  const keys = new Map();
-  let current = null;
-
-  for (const line of matrixBody) {
-    if (line.trim().length === 0 || line.trimStart().startsWith("#")) continue;
-    const indent = line.length - line.trimStart().length;
-
-    const keyMatch = line.match(/^\s*([A-Za-z_][\w-]*)\s*:(.*)$/);
-    if (keyMatch && indent === matrixIndent + 2) {
-      current = keyMatch[1];
-      keys.set(current, [keyMatch[2]]);
-      continue;
-    }
-    // Deeper lines are part of the current key's value — e.g. the `- node: 22`
-    // items of a block sequence.
-    if (current) keys.get(current).push(line);
+function renderMatrixValue(value) {
+  const type = typeof value;
+  if (type === "string" || type === "number" || type === "boolean") {
+    return String(value);
   }
-  return keys;
+  throw new Error(
+    `ci.yml's \`node:\` matrix contains a non-scalar entry ` +
+      `(${JSON.stringify(value)}). A context name is the job name with the ` +
+      "matrix value interpolated as text; this guard models scalars only and " +
+      "will not guess how GitHub stringifies a collection.",
+  );
 }
 
 /**
- * Derives the status-check context names the CI workflow produces, by reading
- * the workflow definition rather than restating it.
+ * Derives the status-check context names a CI workflow produces, by reading the
+ * parsed workflow document rather than restating it.
  *
- * Narrow by design: it understands one matrix job keyed solely on `node`, named
- * `Node ${{ matrix.node }}`. Anything outside that shape throws, because a
- * parser that returned a stale or empty set on an unrecognised workflow would
- * let the assertion pass vacuously — the exact failure this guard exists to
- * prevent, and the one it has already failed at twice.
+ * Narrow by design: it understands one matrix job (`jobs.test`) keyed solely on
+ * `node`. Anything outside that shape throws, because a parser that returned a
+ * stale or empty set on an unrecognised workflow would let the assertion pass
+ * vacuously — the exact failure this guard exists to prevent, and the one it
+ * has already failed at six times.
  *
+ * Takes the YAML as a STRING rather than reading the file itself, so the
+ * mutation suite in `test/ci-contexts-mutations.test.mjs` can exercise the real
+ * code path on a mutated workflow in-process. A guard whose tests can only run
+ * against one file on disk is a guard whose failure modes are untested, and
+ * that is how six bypasses shipped green.
+ *
+ * @param {string} source workflow YAML
  * @returns {string[]} expanded context names, in matrix order
  * @throws {Error} if the workflow no longer matches the expected shape
  */
-export function deriveContextsFromWorkflow() {
-  const lines = readFileSync(WORKFLOW_PATH, "utf8").split("\n");
+export function deriveContextsFromSource(source) {
+  const workflow = parseWorkflow(source);
 
-  // Scoped to the `test:` job, not the first 4-space `name:` in the file:
-  // ci.yml has more than one job, so a bare first-match would read whichever
-  // appears first in the source, making mere job reordering change the result.
-  const job = extractBlock(lines, /^ {2}test:\s*$/, "a `test:` job");
-
-  const nameLine = job.body.find((line) => /^ {4}name:\s*\S/.test(line));
-  if (!nameLine) {
+  const jobs = workflow.jobs;
+  if (jobs === null || typeof jobs !== "object" || Array.isArray(jobs)) {
     throw new Error(
-      "could not find a job-level `name:` in ci.yml's `test:` job — the " +
+      "ci.yml has no `jobs:` mapping — the workflow shape changed and this " +
+        "guard's parser needs updating",
+    );
+  }
+
+  const job = jobs[GATED_JOB_ID];
+  if (job === null || typeof job !== "object" || Array.isArray(job)) {
+    throw new Error(
+      `ci.yml has no \`${GATED_JOB_ID}:\` job (jobs present: ` +
+        `${Object.keys(jobs).join(", ") || "none"}). That job's matrix is ` +
+        "what the required contexts are derived from, so this guard cannot " +
+        "proceed. Note this is read from the PARSED document, so a stray " +
+        `\`${GATED_JOB_ID}:\` elsewhere in the file — in a block scalar, an ` +
+        "input default, another job's `with:` — can no longer be mistaken " +
+        "for it.",
+    );
+  }
+
+  assertJobCanFail(job);
+
+  const strategy = job.strategy;
+  if (strategy === null || typeof strategy !== "object" || Array.isArray(strategy)) {
+    throw new Error(
+      `ci.yml's \`${GATED_JOB_ID}:\` job has no \`strategy:\` mapping, so it ` +
+        "is no longer a matrix job and produces a single context this guard " +
+        "would mis-expand into several",
+    );
+  }
+
+  const matrix = strategy.matrix;
+  if (matrix === null || typeof matrix !== "object" || Array.isArray(matrix)) {
+    throw new Error(
+      `ci.yml's \`${GATED_JOB_ID}.strategy\` has no \`matrix:\` mapping ` +
+        `(got ${Array.isArray(matrix) ? "a sequence" : typeof matrix}) — the ` +
         "workflow shape changed and this guard's parser needs updating",
     );
   }
-  const nameTemplate = nameLine.replace(/^\s*name:\s*/, "").trim();
 
-  if (!nameTemplate.includes("${{ matrix.node }}")) {
-    throw new Error(
-      `job name ${JSON.stringify(nameTemplate)} does not interpolate ` +
-        "`matrix.node`, so contexts are no longer one-per-matrix-value — " +
-        "this guard's parser needs updating",
-    );
-  }
-
-  const matrix = extractBlock(
-    job.body,
-    /^ {6}matrix:\s*$/,
-    "a `matrix:` block in the `test:` job",
-  );
-  const matrixKeys = readMatrixKeys(matrix.body, matrix.indent);
-
-  // Fail closed on ANY key that is not `node`, in any position or style.
-  // `exclude:` removes a combination so a listed version produces no context;
-  // `include:` adds an unlisted one; a second dimension (`os:`, `ts:`)
-  // multiplies every name. Each silently invalidates the derived set, and
-  // hand-modelling GitHub's expansion would be its own source of wrongness.
-  const unsupported = [...matrixKeys.keys()].filter(
+  // Fail closed on ANY key that is not `node`, in any position, spelling or
+  // style. This is an allowlist over the PARSED keys, which is what makes the
+  // whole mutation class inert: `'exclude'`, `"exclude"`, `? exclude`,
+  // `exclud\u0435` (Cyrillic е), a flow mapping, and `<<: *anchor` all arrive
+  // here as an ordinary string key that is not in the allowlist.
+  //
+  // Why these keys are rejected rather than modelled:
+  //   exclude:  removes a combination, so a version in the `node:` list
+  //             produces no context at all (verified: a matrix of [20, 22, 24]
+  //             with `exclude: [{node: 22}]` reported only `Excl 20`/`Excl 24`)
+  //   include:  adds a combination not in the list
+  //   second
+  //   dimension: multiplies every name, and with a name template that
+  //             interpolates only `matrix.node` the names COLLIDE — verified:
+  //             `node: [20]` x `os: [ubuntu-latest, ubuntu-24.04]` reported two
+  //             jobs both named `Two 20`, so protection cannot distinguish them
+  // Hand-modelling GitHub's expansion would be its own source of wrongness.
+  const unsupported = Object.keys(matrix).filter(
     (key) => !SUPPORTED_MATRIX_KEYS.has(key),
   );
   if (unsupported.length > 0) {
     throw new Error(
-      `ci.yml's matrix defines ${unsupported.map((k) => `\`${k}:\``).join(", ")}, ` +
+      `ci.yml's matrix defines ${unsupported.map((k) => `\`${k}\``).join(", ")}, ` +
         "which this guard cannot expand. Those keys change which contexts are " +
         "produced without changing the `node:` list, so the derived set would " +
         "be wrong while this check reported green — wedging `main` on a " +
         "context no run can report. Teach this guard the expansion, or drop " +
-        "the key.",
+        "the key. (Read from the parsed document: quoting, ordering, flow " +
+        "style and `<<:` merge keys do not hide a key from this check.)",
     );
   }
 
-  const nodeValue = matrixKeys.get("node");
-  if (!nodeValue) {
+  const nodeValue = matrix.node;
+  if (nodeValue === undefined) {
     throw new Error(
       "ci.yml's matrix has no `node:` key — the workflow shape changed and " +
         "this guard's parser needs updating",
     );
   }
-
-  // Flow sequence only (`node: [20, 22, 24]`). A block sequence needs
-  // different parsing, so it is rejected rather than mis-read.
-  const flow = nodeValue.join(" ").match(/^\s*\[([^\]]*)\]\s*$/);
-  if (!flow) {
+  if (!Array.isArray(nodeValue)) {
     throw new Error(
-      "ci.yml's `node:` matrix is not a flow sequence (`node: [20, 22]`). " +
-        "This guard reads only that form; convert it back, or teach the guard " +
-        "the other form — it must not guess at the values.",
+      `ci.yml's \`node:\` matrix is not a sequence (got ${typeof nodeValue}). ` +
+        "A matrix dimension must be a list of values for one context to be " +
+        "produced per value.",
     );
   }
-  const versions = flow[1]
-    .split(",")
-    .map((v) => v.trim())
-    .filter((v) => v.length > 0);
-
-  if (versions.length === 0) {
-    throw new Error("parsed an empty `node:` matrix from ci.yml");
+  if (nodeValue.length === 0) {
+    throw new Error(
+      "ci.yml's `node:` matrix is an empty sequence, so the gated job " +
+        "produces no contexts at all and every required check would be " +
+        "unreportable",
+    );
   }
 
-  return versions.map((v) => nameTemplate.replaceAll("${{ matrix.node }}", v));
+  const versions = nodeValue.map(renderMatrixValue);
+  const duplicates = versions.filter((v, i) => versions.indexOf(v) !== i);
+  if (duplicates.length > 0) {
+    throw new Error(
+      `ci.yml's \`node:\` matrix renders duplicate values ` +
+        `[${[...new Set(duplicates)].join(", ")}], so two matrix jobs would ` +
+        "report the same context name and protection could not tell them " +
+        "apart. (Note the YAML type does not disambiguate: `20` and `\"20\"` " +
+        "both render as `20`.)",
+    );
+  }
+
+  const nameTemplate = resolveJobNameTemplate(job);
+  return versions.map((v) =>
+    nameTemplate.replace(MATRIX_NODE_EXPRESSION_ALL, () => v),
+  );
+}
+
+/**
+ * `deriveContextsFromSource` applied to the repository's own `ci.yml`.
+ *
+ * @returns {string[]} expanded context names, in matrix order
+ * @throws {Error} if the workflow no longer matches the expected shape
+ */
+export function deriveContextsFromWorkflow() {
+  return deriveContextsFromSource(readFileSync(WORKFLOW_PATH, "utf8"));
+}
+
+// `${{ matrix.node }}` with any internal whitespace, which YAML preserves and
+// GitHub tolerates.
+//
+// Deliberately TWO regexes rather than one shared `/g` literal: `.test()` on a
+// global regex advances `lastIndex` and the next call starts mid-string, so a
+// shared literal would return a different answer on its second invocation. That
+// is precisely the kind of stateful subtlety that produced the previous six
+// bypasses, so the matching one is non-global and the replacing one is global.
+const MATRIX_NODE_EXPRESSION = /\$\{\{\s*matrix\.node\s*\}\}/;
+const MATRIX_NODE_EXPRESSION_ALL = /\$\{\{\s*matrix\.node\s*\}\}/g;
+// Any expression at all, used to reject templates containing an interpolation
+// this guard cannot evaluate.
+const ANY_EXPRESSION = /\$\{\{[^}]*\}\}/g;
+
+/**
+ * Works out the name template GitHub will report the gated job's checks under.
+ *
+ * Two cases, both verified against a real run rather than assumed
+ * (edgeorgie/qa-injection-test-repo run 38235526774):
+ *
+ *   - job-level `name:` present → that template, expanded. A job named
+ *     `Node ${{ matrix.node }}` reported `Node 20` / `Node 24`.
+ *   - job-level `name:` ABSENT → GitHub falls back to `<job id> (<values>)`.
+ *     A job with id `unnamed` and `node: [20, 24]` reported
+ *     `unnamed (20)` / `unnamed (24)` — note the job id verbatim and the
+ *     parenthesised value, NOT the id alone. The previous version of this file
+ *     threw when `name:` was missing, which is safe but wrong: removing the
+ *     `name:` line is a plausible edit and the derived set is knowable.
+ *
+ * @param {object} job the parsed gated job
+ * @returns {string} a template containing `${{ matrix.node }}`
+ * @throws {Error} if the name cannot be expanded by this guard
+ */
+function resolveJobNameTemplate(job) {
+  if (!("name" in job) || job.name === null || job.name === undefined) {
+    return `${GATED_JOB_ID} (\${{ matrix.node }})`;
+  }
+
+  if (typeof job.name !== "string") {
+    throw new Error(
+      `ci.yml's \`${GATED_JOB_ID}.name\` is not a string ` +
+        `(${JSON.stringify(job.name)}), so the reported context name cannot ` +
+        "be derived",
+    );
+  }
+  const template = job.name.trim();
+  if (template.length === 0) {
+    throw new Error(
+      `ci.yml's \`${GATED_JOB_ID}.name\` is empty, so what GitHub reports as ` +
+        "the context name is not something this guard will guess at",
+    );
+  }
+
+  if (!MATRIX_NODE_EXPRESSION.test(template)) {
+    throw new Error(
+      `job name ${JSON.stringify(template)} does not interpolate ` +
+        "`matrix.node`, so every matrix job would report the SAME context " +
+        "name and protection could not distinguish them — this guard's " +
+        "parser needs updating",
+    );
+  }
+
+  // Anything else interpolated into the name is a value this guard cannot
+  // evaluate (`github.*`, `env.*`, another matrix key), so the derived names
+  // would be wrong in a way that looks right.
+  const foreign = template
+    .replace(MATRIX_NODE_EXPRESSION_ALL, "")
+    .match(ANY_EXPRESSION);
+  if (foreign) {
+    throw new Error(
+      `job name ${JSON.stringify(template)} interpolates ` +
+        `${foreign.join(", ")}, which this guard cannot evaluate. The derived ` +
+        "context names would not be the ones GitHub reports. Remove the " +
+        "expression, or teach this guard to evaluate it.",
+    );
+  }
+
+  return template;
+}
+
+/**
+ * Asserts the gated job is still CAPABLE OF FAILING the merge gate.
+ *
+ * A required status check is only a gate if a broken commit can make it red.
+ * Two one-line edits leave the matrix, the job name and every context name
+ * completely untouched while disarming all of them:
+ *
+ *   continue-on-error: true   the job reports SUCCESS even when its steps fail,
+ *                             so the required context is decorative
+ *   if: <condition>            a skipped job's required context is treated by
+ *                             branch protection as satisfied, so the gate is
+ *                             simply absent for any commit the condition
+ *                             excludes
+ *
+ * Neither is visible to a matrix parser, which is why they are checked here
+ * explicitly rather than left as a documented blind spot. This is the same
+ * defect class as the `npm audit --omit=dev` step that could not fail at any
+ * severity, one level up: a gate that cannot report failure is not a gate.
+ *
+ * Step-level `continue-on-error: true` is rejected for the same reason — a
+ * failing step that is excused does not fail the job. If one is ever genuinely
+ * needed, the honest move is to split that work into a separate non-required
+ * job, not to excuse it inside the gate.
+ *
+ * @param {object} job the parsed gated job
+ * @throws {Error} if the job cannot fail
+ */
+function assertJobCanFail(job) {
+  if ("continue-on-error" in job && job["continue-on-error"] !== false) {
+    throw new Error(
+      `ci.yml's \`${GATED_JOB_ID}:\` job sets \`continue-on-error: ` +
+        `${JSON.stringify(job["continue-on-error"])}\`. The job then reports ` +
+        "SUCCESS even when its steps fail, so every required context it " +
+        "produces still reports — and reports green unconditionally. The " +
+        "merge gate becomes decorative with the matrix, the job name and the " +
+        "context names all unchanged, which is why no name-based check can " +
+        "catch this.",
+    );
+  }
+
+  if ("if" in job && job.if !== null && job.if !== undefined) {
+    throw new Error(
+      `ci.yml's \`${GATED_JOB_ID}:\` job is conditional ` +
+        `(\`if: ${String(job.if)}\`). Branch protection treats a SKIPPED ` +
+        "job's required context as satisfied, so for every commit the " +
+        "condition excludes the gate is silently absent — with no change to " +
+        "any context name. Gate the work inside the steps if it must be " +
+        "conditional, or move it to a job that is not required.",
+    );
+  }
+
+  const steps = job.steps;
+  if (Array.isArray(steps)) {
+    const excused = steps.filter(
+      (step) =>
+        step !== null &&
+        typeof step === "object" &&
+        "continue-on-error" in step &&
+        step["continue-on-error"] !== false,
+    );
+    if (excused.length > 0) {
+      throw new Error(
+        `ci.yml's \`${GATED_JOB_ID}:\` job has ${excused.length} step(s) ` +
+          "with `continue-on-error` set. A failing step that is excused does " +
+          "not fail the job, so that part of the gate cannot report red. " +
+          "Move the work to a separate non-required job instead of excusing " +
+          "it inside the gated one.",
+      );
+    }
+  }
 }

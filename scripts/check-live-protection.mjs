@@ -32,13 +32,26 @@
 //     unprotected, so both fail here. That conflation is safe in this
 //     direction; it would not be if the check reported "protected".
 //
-// `bypass_actors` used to be listed here as a second blind spot, on the grounds
-// that this endpoint does not return it. That was true but not a limitation: the
-// response carries `ruleset_id`, and GET /repos/{o}/{r}/rulesets/{id} returns
-// bypass_actors under the same `metadata: read`. The check now follows that id,
-// because a ruleset requiring every context with a bypass actor attached is a
-// gate the listed actor merges straight past — the same shape as
-// `enforce_admins: false`.
+//   - `bypass_actors` IS NOT READABLE by the credential this normally runs
+//     under, and this check no longer pretends otherwise. An earlier version of
+//     this file claimed `GET /repos/{o}/{r}/rulesets/{id}` returns
+//     `bypass_actors` under the same `metadata: read`. That claim was wrong.
+//     GitHub's REST reference for "Get a repository ruleset" states the
+//     property "is only returned if the user making the API request has write
+//     access to the ruleset" — i.e. `Administration: write`, which
+//     `GITHUB_TOKEN` cannot be granted. Verified against this repository's own
+//     ruleset 24916437: an admin PAT gets a body whose keys include
+//     `bypass_actors`; the identical UNAUTHENTICATED request returns HTTP 200
+//     with that key ABSENT from the body — withheld, not empty. The old code
+//     read `ruleset.bypass_actors ?? []`, which maps "withheld because you may
+//     not see it" onto "there are none", and then printed "no bypass actors".
+//     That is fail-open on a gate-bypass check, and strictly worse than the
+//     honest blind-spot disclosure it replaced: the reader was told the
+//     all-clear instead of being told nothing was checked. It now reports
+//     NOT VERIFIED and exits non-zero unless the operator accepts the blind
+//     spot explicitly (`ALLOW_UNVERIFIED_BYPASS_ACTORS=1`). An unreadable
+//     field is unverified, not clean — the same principle this file already
+//     applied to an unreadable ruleset.
 //
 // WHY THIS IS NOT ITSELF A REQUIRED STATUS CHECK
 //
@@ -53,54 +66,18 @@ import { deriveContextsFromWorkflow } from "./ci-contexts.mjs";
 
 const REPO = process.env.GITHUB_REPOSITORY ?? "edgeorgie/agentlens";
 const BRANCH = "main";
-// `?per_page=100`: this endpoint paginates at 30 by default, and a truncated
-// page would silently drop a rule — making an absent `deletion` rule, or a
-// second ruleset's bypass actors, read as "not present" rather than "not shown".
-const API = `https://api.github.com/repos/${REPO}/rules/branches/${BRANCH}?per_page=100`;
+const API_ROOT = "https://api.github.com";
 
-
-/**
- * Fetches the rules that apply to `main`, with a short retry on transient
- * failures so a single blip does not produce a misleading report.
- *
- * @returns {Promise<Array<{type: string, parameters?: object}>>}
- * @throws {Error} if the API cannot be read after retries
- */
-async function fetchLiveRules() {
-  const headers = { Accept: "application/vnd.github+json" };
-  // Authenticate when a token is present (private repos, and a far higher rate
-  // limit), but do not require one: on a public repo this endpoint is readable
-  // anonymously, so the check still works in a fork or a local run.
-  if (process.env.GITHUB_TOKEN) {
-    headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
-  }
-
-  let lastError;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const res = await fetch(API, { headers });
-      if (!res.ok) {
-        throw new Error(`${API} responded HTTP ${res.status} ${res.statusText}`);
-      }
-      const body = await res.json();
-      if (!Array.isArray(body)) {
-        throw new Error(
-          `expected a JSON array of rules, got ${typeof body}: ` +
-            JSON.stringify(body).slice(0, 200),
-        );
-      }
-      return body;
-    } catch (error) {
-      lastError = error;
-      if (attempt < 3) {
-        await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
-      }
-    }
-  }
-  throw new Error(
-    `could not read live branch rules after 3 attempts: ${lastError?.message}`,
-  );
-}
+// When set, a WITHHELD `bypass_actors` is reported as a loud warning instead of
+// failing the run. This exists so the daily cron stays useful under
+// `GITHUB_TOKEN`, which structurally cannot read that field (see the header),
+// while every drift assertion it CAN make keeps running. It never silently
+// claims the gate is unbypassable: with this set the ✓ line reads "bypass
+// actors NOT VERIFIED". The better fix is to run this step with a PAT or App
+// token holding `Administration: write` and leave this unset, which makes the
+// check real rather than disclosed.
+const ALLOW_UNVERIFIED_BYPASS_ACTORS =
+  process.env.ALLOW_UNVERIFIED_BYPASS_ACTORS === "1";
 
 /**
  * Exits non-zero with an explanation. Collected into one place so every failure
@@ -112,6 +89,127 @@ async function fetchLiveRules() {
 function fail(message) {
   console.error(`✗ live branch protection check FAILED\n\n${message}\n`);
   process.exit(1);
+}
+
+/**
+ * GETs a GitHub API path, retrying transient failures so a single blip does not
+ * produce a misleading report.
+ *
+ * This is deliberately the ONLY fetch in this file. The previous version had a
+ * resilient 3-attempt loop for the rules endpoint and, 150 lines later, a bare
+ * `await fetch(...)` with no retry and no `try/catch` for the per-ruleset
+ * endpoint. On a daily cron that asymmetry meant a transient 502 on the second
+ * endpoint produced a red run AND a filed GitHub issue, while the identical
+ * blip on the first was retried away — and a DNS failure there REJECTED
+ * unhandled, so a V8 stack trace became the body of that issue. One policy,
+ * both call sites, one place to change it.
+ *
+ * Retries 5xx, 429 and network-level rejections. Does NOT retry other 4xx: a
+ * 401/403/404 is an answer, not a blip, so retrying only delays the report.
+ *
+ * Returns a discriminated result instead of throwing, so a caller can tell
+ * "could not read" apart from "read it, here is what it said" without a
+ * `catch` that flattens both into one.
+ *
+ * @param {string} path API path beginning with `/`
+ * @param {{attempts?: number}} [options]
+ * @returns {Promise<{ok: true, body: unknown, link: string} | {ok: false, error: string}>}
+ */
+async function fetchJson(path, { attempts = 3 } = {}) {
+  const headers = { Accept: "application/vnd.github+json" };
+  // Authenticate when a token is present (private repos, and a far higher rate
+  // limit), but do not require one: on a public repo these endpoints are
+  // readable anonymously, so the check still works in a fork or a local run.
+  if (process.env.GITHUB_TOKEN) {
+    headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  }
+
+  let lastError = "unknown error";
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let res;
+    try {
+      res = await fetch(`${API_ROOT}${path}`, { headers });
+    } catch (error) {
+      // fetch REJECTS on a DNS failure or socket reset rather than resolving.
+      // Caught so it becomes a curated message instead of an unhandled
+      // rejection whose stack trace gets pasted into a GitHub issue.
+      lastError = `network error contacting ${path}: ${error?.message ?? error}`;
+      if (attempt < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
+        continue;
+      }
+      break;
+    }
+
+    if (res.ok) {
+      try {
+        return {
+          ok: true,
+          body: await res.json(),
+          link: res.headers.get("link") ?? "",
+        };
+      } catch (error) {
+        lastError = `${path} returned unparseable JSON: ${error?.message ?? error}`;
+        break;
+      }
+    }
+
+    lastError = `${path} responded HTTP ${res.status} ${res.statusText}`;
+    const transient = res.status >= 500 || res.status === 429;
+    if (!transient || attempt === attempts) break;
+    await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
+  }
+  return { ok: false, error: `${lastError} (after ${attempts} attempt(s))` };
+}
+
+/**
+ * Fetches every rule applying to `BRANCH`, following `Link` pagination.
+ *
+ * The previous version appended `?per_page=100` and commented that this closed
+ * a truncation hole. It did not — it raised the cap from GitHub's documented
+ * default of 30 to 100 and still never requested page 2, so at 101+ applicable
+ * rules a rule would be silently dropped and an absent `deletion` rule would
+ * read as "not present" rather than "not shown": the exact failure mode the
+ * comment claimed to have eliminated, mitigated by a factor of 3.3. This
+ * follows `Link: rel="next"` to exhaustion, so the set is complete at any size.
+ * (This repository has 3 rules, so the practical effect today is nil. The point
+ * is that the comment is now true.)
+ *
+ * @returns {Promise<Array<{type: string, ruleset_id?: number, parameters?: object}>>}
+ * @throws {Error} if the rules cannot be read
+ */
+async function fetchLiveRules() {
+  const rules = [];
+  const seen = new Set();
+  let path = `/repos/${REPO}/rules/branches/${BRANCH}?per_page=100`;
+
+  while (path) {
+    // Defensive: a self-referential or cyclic Link header must not spin.
+    if (seen.has(path)) break;
+    seen.add(path);
+
+    const result = await fetchJson(path);
+    if (!result.ok) {
+      throw new Error(`could not read live branch rules: ${result.error}`);
+    }
+    if (!Array.isArray(result.body)) {
+      throw new Error(
+        `expected a JSON array of rules, got ${typeof result.body}: ` +
+          JSON.stringify(result.body).slice(0, 200),
+      );
+    }
+    rules.push(...result.body);
+
+    const next = result.link
+      .split(",")
+      .map((part) => part.trim())
+      .find((part) => part.endsWith('rel="next"'));
+    path = next
+      ? next.slice(next.indexOf("<") + 1, next.indexOf(">")).replace(API_ROOT, "")
+      : null;
+  }
+
+  return rules;
 }
 
 const [rules, expected] = await Promise.all([
@@ -211,41 +309,100 @@ if (absentRules.length > 0) {
   );
 }
 
-// bypass_actors is the ruleset analogue of `enforce_admins: false`, and it is
-// NOT returned by /rules/branches/{branch} — that endpoint lists the rules that
-// apply, not who may ignore them. So the check followed the ruleset_id here: a
-// ruleset requiring all three contexts with a bypass actor attached is a gate
-// that the listed actor merges straight past, and without this the script would
-// print its ✓ while `main` was effectively open to them.
+// ---------------------------------------------------------------------------
+// bypass_actors
+// ---------------------------------------------------------------------------
 //
-// Fetched per distinct ruleset_id (rules can come from more than one ruleset,
-// including org-level ones). A failure to read a ruleset is reported rather
-// than ignored — an unreadable ruleset is an unverified one, not a clean one.
+// bypass_actors is the ruleset analogue of `enforce_admins: false`: a ruleset
+// requiring every context with a bypass actor attached is a gate that actor
+// merges straight past, which makes this script's ✓ misleading rather than
+// wrong. It is NOT returned by /rules/branches/{branch} — that endpoint lists
+// the rules that apply, not who may ignore them — so the check follows each
+// distinct ruleset_id (rules can come from more than one ruleset, including
+// org-level ones).
+//
+// Three outcomes, all explicit, none of them silent:
+//   readable + empty       → verified unbypassable
+//   readable + non-empty   → FAIL, listing the actors
+//   withheld / unreadable  → NOT VERIFIED: fails, or warns loudly when the
+//                            operator has set ALLOW_UNVERIFIED_BYPASS_ACTORS=1
+//
+// The third case is the one that was fail-open. See the header for the API
+// evidence; the short version is that `?? []` cannot tell "you may not see
+// this" from "there are none", and only one of those is good news.
 const rulesetIds = [
   ...new Set(rules.map((r) => r.ruleset_id).filter((id) => id != null)),
 ];
+
+// An empty id list used to make the loop below iterate zero times, leaving
+// `bypassFindings` empty so the ✓ printed "no bypass actors on 0 ruleset(s)" —
+// a vacuous pass in a file whose central design claim is refusing to pass
+// vacuously. Rules DO apply (asserted above), so all of them lacking a
+// `ruleset_id` means the response shape changed and nothing was inspected.
+if (rulesetIds.length === 0) {
+  fail(
+    `rules apply to \`${BRANCH}\` but NONE of them carries a \`ruleset_id\`, ` +
+      "so there is no ruleset to inspect for bypass actors and that half of " +
+      "this check verified nothing. It previously printed a ✓ reading " +
+      '"no bypass actors on 0 ruleset(s)", which asserted a clean result from ' +
+      "zero observations. The API response shape has changed; this guard " +
+      `needs updating.\n\nRules returned: [${rules.map((r) => r.type).join(", ")}]`,
+  );
+}
+
 const bypassFindings = [];
+const unverified = [];
 for (const id of rulesetIds) {
-  const res = await fetch(`https://api.github.com/repos/${REPO}/rulesets/${id}`, {
-    headers: {
-      Accept: "application/vnd.github+json",
-      ...(process.env.GITHUB_TOKEN
-        ? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` }
-        : {}),
-    },
-  });
-  if (!res.ok) {
-    bypassFindings.push(
-      `  ruleset ${id}: NOT VERIFIED — HTTP ${res.status} reading ` +
-        `/rulesets/${id}, so its bypass actors are unknown`,
+  const result = await fetchJson(`/repos/${REPO}/rulesets/${id}`);
+  if (!result.ok) {
+    unverified.push(
+      `ruleset ${id}: NOT VERIFIED — ${result.error}, so its bypass actors ` +
+        "are unknown",
     );
     continue;
   }
-  const ruleset = await res.json();
-  const actors = ruleset.bypass_actors ?? [];
+  const ruleset = result.body;
+  if (ruleset === null || typeof ruleset !== "object") {
+    unverified.push(
+      `ruleset ${id}: NOT VERIFIED — expected a ruleset object, got ` +
+        `${typeof ruleset}`,
+    );
+    continue;
+  }
+
+  // The load-bearing distinction, and the whole of F2: `in` separates "the
+  // field is absent because this caller may not see it" from "the field is
+  // present and empty". `?? []` collapsed both into "clean".
+  if (!("bypass_actors" in ruleset)) {
+    unverified.push(
+      `ruleset ${id}${ruleset.name ? ` ("${ruleset.name}")` : ""}: NOT ` +
+        "VERIFIED — the API WITHHELD `bypass_actors`. GitHub returns that " +
+        "property only to callers with write access to the ruleset " +
+        "(`Administration: write`), which `GITHUB_TOKEN` cannot be granted, " +
+        "so this check cannot confirm the gate is unbypassable. Either run " +
+        "this step with a PAT/App token that has that access, or accept the " +
+        "blind spot explicitly with ALLOW_UNVERIFIED_BYPASS_ACTORS=1." +
+        (ruleset.current_user_can_bypass
+          ? ` (\`current_user_can_bypass\` for THIS token is ` +
+            `"${ruleset.current_user_can_bypass}" — that is a statement about ` +
+            "this caller only, not about other actors, so it is a partial " +
+            "substitute and not a drop-in.)"
+          : ""),
+    );
+    continue;
+  }
+
+  const actors = ruleset.bypass_actors;
+  if (!Array.isArray(actors)) {
+    unverified.push(
+      `ruleset ${id}: NOT VERIFIED — \`bypass_actors\` was present but is ` +
+        `${typeof actors}, not an array; the response shape changed`,
+    );
+    continue;
+  }
   if (actors.length > 0) {
     bypassFindings.push(
-      `  ruleset ${id} ("${ruleset.name}") grants ${actors.length} bypass ` +
+      `ruleset ${id} ("${ruleset.name}") grants ${actors.length} bypass ` +
         `actor(s): ${actors
           .map((a) => `${a.actor_type}#${a.actor_id} (${a.bypass_mode})`)
           .join(", ")}`,
@@ -255,18 +412,40 @@ for (const id of rulesetIds) {
 
 if (bypassFindings.length > 0) {
   fail(
-    "the required contexts match, but the gate is bypassable (or could not " +
-      `be confirmed otherwise):\n\n${bypassFindings.join("\n")}\n\n` +
+    "the required contexts match, but the gate is BYPASSABLE:\n\n" +
+      `${bypassFindings.map((f) => `  ${f}`).join("\n")}\n\n` +
       "A bypass actor merges past every required check above, which makes " +
       "this check's ✓ misleading rather than wrong. Remove the actors, or " +
       "add them to an explicit allowlist in this script with a stated reason.",
   );
 }
 
+if (unverified.length > 0 && !ALLOW_UNVERIFIED_BYPASS_ACTORS) {
+  fail(
+    "the required contexts match, but whether the gate is BYPASSABLE could " +
+      `not be determined:\n\n${unverified.map((f) => `  ${f}`).join("\n")}\n\n` +
+      "This is a failure rather than something passed over because an " +
+      "unreadable field is unverified, not clean — the previous version of " +
+      'this check printed "no bypass actors" here, which was a claim it had ' +
+      "not established and structurally could not. Set " +
+      "ALLOW_UNVERIFIED_BYPASS_ACTORS=1 to downgrade it to a warning if the " +
+      "credential genuinely cannot be upgraded.",
+  );
+}
+
+for (const line of unverified) {
+  console.warn(`⚠ ${line}`);
+}
+
+const bypassVerdict =
+  unverified.length > 0
+    ? `bypass actors NOT VERIFIED on ${unverified.length} of ` +
+      `${rulesetIds.length} ruleset(s) — see the warning(s) above`
+    : `no bypass actors on ${rulesetIds.length} ruleset(s)`;
+
 console.log(
   `✓ live ruleset on ${REPO}@${BRANCH} requires exactly the contexts ci.yml ` +
     `produces: [${[...live].sort().join(", ")}] (strict base policy on, ` +
-    `${requiredRuleTypes.join(" + ")} active, no bypass actors on ` +
-    `${rulesetIds.length} ruleset(s))`,
+    `${requiredRuleTypes.join(" + ")} active, ${bypassVerdict})`,
 );
 
