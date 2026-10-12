@@ -24,19 +24,29 @@
 # 2. Update this file to the new names. CI goes green.
 # 3. The PR is still unmergeable: protection requires the old names. Update it:
 #
-#      gh api -X PATCH repos/edgeorgie/agentlens/branches/main/protection/required_status_checks \
-#        -f 'contexts[]=<new name 1>' -f 'contexts[]=<new name 2>'
+#      gh api repos/edgeorgie/agentlens/rulesets \
+#        --jq '.[] | select(.target=="branch") | .id'
+#      gh api -X PUT repos/edgeorgie/agentlens/rulesets/<id> --input <edited.json>
 #
-#    (Use PATCH, not PUT, on this sub-resource: PUT on the parent `protection`
-#    object is a full REPLACE and will silently reset sibling settings such as
-#    `enforce_admins`.)
+#    (`main` is protected by a RULESET, not classic branch protection. See
+#    `scripts/check-live-protection.mjs` for why it was migrated.)
 # 4. Re-run the PR's checks. The new contexts report and the PR merges.
 #
 # Step 3 needs admin on the repo, so it cannot be done from inside a workflow
-# run — `GITHUB_TOKEN` cannot read or write branch protection. That is precisely
-# why this is a committed mirror guarded by a test, rather than a live API
-# assertion: the test cannot fix the drift, but it can refuse to let it land
-# unnoticed.
+# run. That is why this mirror exists at all: the test cannot fix the drift, but
+# it can refuse to let it land unnoticed.
+#
+# WHAT THIS FILE DOES NOT PROVE
+#
+# This mirror plus its test prove `mirror == workflow`. They cannot prove
+# `mirror == live protection`, and live protection is what actually wedges
+# `main`. That second half is now checked directly by the `protection-drift` job
+# in ci.yml, which reads the live ruleset from the REST API on every `main` push
+# and on a daily schedule — possible because rulesets are readable with
+# `metadata: read`, where classic protection needed `administration` and so was
+# invisible to `GITHUB_TOKEN`. So: this file catches a drifting PR at review
+# time, and that job catches a drifting repository SETTING, which no PR-time
+# check can observe.
 #
 # Blank lines and `#` comments are ignored. One context name per line.
 
