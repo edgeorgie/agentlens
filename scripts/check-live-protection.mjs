@@ -25,14 +25,20 @@
 //
 // WHAT THIS CANNOT SEE (stated so the check is not over-trusted)
 //
-//   - `bypass_actors`. This endpoint returns the rules that apply, not who may
-//     bypass them. A ruleset granting a bypass actor is invisible here.
 //   - Rulesets whose enforcement is `evaluate` or `disabled` are omitted from
 //     the response entirely (documented behaviour). This check therefore cannot
 //     distinguish "no ruleset exists" from "a ruleset exists but is switched
 //     off" — both surface as a missing rule, and both mean `main` is
 //     unprotected, so both fail here. That conflation is safe in this
 //     direction; it would not be if the check reported "protected".
+//
+// `bypass_actors` used to be listed here as a second blind spot, on the grounds
+// that this endpoint does not return it. That was true but not a limitation: the
+// response carries `ruleset_id`, and GET /repos/{o}/{r}/rulesets/{id} returns
+// bypass_actors under the same `metadata: read`. The check now follows that id,
+// because a ruleset requiring every context with a bypass actor attached is a
+// gate the listed actor merges straight past — the same shape as
+// `enforce_admins: false`.
 //
 // WHY THIS IS NOT ITSELF A REQUIRED STATUS CHECK
 //
@@ -47,7 +53,11 @@ import { deriveContextsFromWorkflow } from "./ci-contexts.mjs";
 
 const REPO = process.env.GITHUB_REPOSITORY ?? "edgeorgie/agentlens";
 const BRANCH = "main";
-const API = `https://api.github.com/repos/${REPO}/rules/branches/${BRANCH}`;
+// `?per_page=100`: this endpoint paginates at 30 by default, and a truncated
+// page would silently drop a rule — making an absent `deletion` rule, or a
+// second ruleset's bypass actors, read as "not present" rather than "not shown".
+const API = `https://api.github.com/repos/${REPO}/rules/branches/${BRANCH}?per_page=100`;
+
 
 /**
  * Fetches the rules that apply to `main`, with a short retry on transient
@@ -184,7 +194,79 @@ if (statusCheckRule.parameters?.strict_required_status_checks_policy !== true) {
   );
 }
 
+// The deletion and non-fast-forward rules are asserted too, because the
+// contexts matching says nothing about them: delete both and this check would
+// have stayed green while `main` became force-pushable and deletable.
+const requiredRuleTypes = ["deletion", "non_fast_forward"];
+const presentTypes = new Set(rules.map((r) => r.type));
+const absentRules = requiredRuleTypes.filter((t) => !presentTypes.has(t));
+if (absentRules.length > 0) {
+  fail(
+    `the required contexts match, but these rules are no longer active on ` +
+      `\`${BRANCH}\`: [${absentRules.join(", ")}].\n\n` +
+      "Without `deletion` the branch can be deleted; without " +
+      "`non_fast_forward` it can be force-pushed, which rewrites merged " +
+      "history and discards the CI results this check just validated.\n\n" +
+      `Rules currently active: [${[...presentTypes].join(", ")}]`,
+  );
+}
+
+// bypass_actors is the ruleset analogue of `enforce_admins: false`, and it is
+// NOT returned by /rules/branches/{branch} — that endpoint lists the rules that
+// apply, not who may ignore them. So the check followed the ruleset_id here: a
+// ruleset requiring all three contexts with a bypass actor attached is a gate
+// that the listed actor merges straight past, and without this the script would
+// print its ✓ while `main` was effectively open to them.
+//
+// Fetched per distinct ruleset_id (rules can come from more than one ruleset,
+// including org-level ones). A failure to read a ruleset is reported rather
+// than ignored — an unreadable ruleset is an unverified one, not a clean one.
+const rulesetIds = [
+  ...new Set(rules.map((r) => r.ruleset_id).filter((id) => id != null)),
+];
+const bypassFindings = [];
+for (const id of rulesetIds) {
+  const res = await fetch(`https://api.github.com/repos/${REPO}/rulesets/${id}`, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      ...(process.env.GITHUB_TOKEN
+        ? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` }
+        : {}),
+    },
+  });
+  if (!res.ok) {
+    bypassFindings.push(
+      `  ruleset ${id}: NOT VERIFIED — HTTP ${res.status} reading ` +
+        `/rulesets/${id}, so its bypass actors are unknown`,
+    );
+    continue;
+  }
+  const ruleset = await res.json();
+  const actors = ruleset.bypass_actors ?? [];
+  if (actors.length > 0) {
+    bypassFindings.push(
+      `  ruleset ${id} ("${ruleset.name}") grants ${actors.length} bypass ` +
+        `actor(s): ${actors
+          .map((a) => `${a.actor_type}#${a.actor_id} (${a.bypass_mode})`)
+          .join(", ")}`,
+    );
+  }
+}
+
+if (bypassFindings.length > 0) {
+  fail(
+    "the required contexts match, but the gate is bypassable (or could not " +
+      `be confirmed otherwise):\n\n${bypassFindings.join("\n")}\n\n` +
+      "A bypass actor merges past every required check above, which makes " +
+      "this check's ✓ misleading rather than wrong. Remove the actors, or " +
+      "add them to an explicit allowlist in this script with a stated reason.",
+  );
+}
+
 console.log(
   `✓ live ruleset on ${REPO}@${BRANCH} requires exactly the contexts ci.yml ` +
-    `produces: [${[...live].sort().join(", ")}] (strict base policy on)`,
+    `produces: [${[...live].sort().join(", ")}] (strict base policy on, ` +
+    `${requiredRuleTypes.join(" + ")} active, no bypass actors on ` +
+    `${rulesetIds.length} ruleset(s))`,
 );
+
