@@ -494,6 +494,106 @@ function assertJobCanFail(job) {
         "it inside the gated one.",
     );
   }
+
+  // Step-level `if:`, the eighth bypass of this guard's recurring class.
+  //
+  // The job-level `if:` check above exists because a SKIPPED job's required
+  // context is treated as satisfied. The step-level spelling was missing, and
+  // it is strictly easier to get wrong: a skipped step does not skip the job,
+  // so the job runs, SUCCEEDS, and reports all three required contexts green
+  // while the work behind one of them never executed. Nothing else in this
+  // module or in `test/typecheck-gate.test.mjs` could see it — the context
+  // names are untouched and `deriveGatedJobRunCommands` returned the step's
+  // `run` string whether or not the step could ever run.
+  //
+  // Measured on the revision that added this check, with the then-current
+  // guard and the full `npm test` suite:
+  //
+  //   `- if: false` on `npm run typecheck:bin`           → contexts identical,
+  //                                                         gate test PASSES
+  //   `- if: github.event_name == 'schedule'` on it      → same
+  //   `- if: false` on `npm test`                        → same (and this one
+  //                                                         disarms the layer
+  //                                                         that tests the gate)
+  //   `<<: *anchor` carrying `if: false`                 → same
+  //
+  // All four are rejected here. The discriminating controls, which already
+  // worked and must keep working: deleting the step outright is caught by
+  // `typecheck-gate.test.mjs` (the command disappears from the list), and
+  // step-level `continue-on-error` is caught immediately above.
+  //
+  // Every step is covered, `uses:` as well as `run:`: a conditional
+  // `setup-node` would silently run the whole matrix on the runner's default
+  // Node while every context name still claimed a version.
+  const conditional = steps.filter(
+    (step) =>
+      isMapping(step) &&
+      "if" in step &&
+      step.if !== null &&
+      step.if !== undefined,
+  );
+  if (conditional.length > 0) {
+    throw new Error(
+      `ci.yml's \`${GATED_JOB_ID}:\` job has ${conditional.length} ` +
+        `conditional step(s) (\`if: ${conditional
+          .map((step) => String(/** @type {Record<string, unknown>} */ (step).if))
+          .join("`, `if: ")}\`). A skipped step does NOT skip the job, so the ` +
+        "job still succeeds and still reports every required context green " +
+        "with that step's work never executed — no context name changes and " +
+        "no presence check notices, because the step is still in the file. " +
+        "If the work is genuinely conditional, put the condition inside the " +
+        "command, or move the step to a job that is not required.",
+    );
+  }
+
+  assertNoShellFailureSuppression(steps);
+}
+
+// Shell idioms that discard a command's exit status. Unlike everything else in
+// this module these are matched against TEXT, and that is a deliberate,
+// narrower claim: a `run:` block is a shell script, so there is no parsed
+// representation to assert on the way there is for YAML. The guard is therefore
+// a detector for the idioms that appear in practice, NOT a proof of
+// unsuppressability — `sh -c 'cmd; true'`, a wrapper script, or a trap can all
+// still swallow a failure. Saying so is the point: six of this file's bypasses
+// came from a check that was sold as exhaustive and was not.
+//
+// `ci.yml`'s own audit-step comment already states `|| true` is "deliberately
+// NOT used ... a gate that cannot fail is the defect being fixed". Nothing
+// enforced it, so it was a convention, not a guard.
+const SHELL_SUPPRESSION_PATTERNS = [
+  // `cmd || true`, `|| :`, `|| echo ...` — the status becomes the right-hand
+  // side's.
+  { re: /\|\|\s*(true|:|echo\b)/, why: "`|| true` / `|| :` / `|| echo` discards the exit status" },
+  // A trailing `exit 0` in a multi-line block: the script's status is the last
+  // command's, so everything above it is advisory.
+  { re: /(^|\n)\s*exit\s+0\s*(\n|$)/, why: "a trailing `exit 0` makes every preceding command advisory" },
+  // `set +e` turns off the default `bash -e` abort for the rest of the block.
+  { re: /(^|\n|;)\s*set\s+\+e\b/, why: "`set +e` disables the shell's abort-on-error for the rest of the block" },
+];
+
+/**
+ * Asserts no gated step discards its own exit status in the shell.
+ *
+ * @param {unknown[]} steps the gated job's parsed steps
+ * @throws {Error} if a `run:` block suppresses failure
+ */
+function assertNoShellFailureSuppression(steps) {
+  for (const step of steps) {
+    if (!isMapping(step) || typeof step.run !== "string") continue;
+    for (const { re, why } of SHELL_SUPPRESSION_PATTERNS) {
+      if (re.test(step.run)) {
+        throw new Error(
+          `ci.yml's \`${GATED_JOB_ID}:\` job has a step whose shell discards ` +
+            `failure — ${why}:\n\n    ${step.run.split("\n").join("\n    ")}\n\n` +
+            "The step then reports success regardless of the command's " +
+            "result, so the required context it contributes to is " +
+            "decorative, with no change to any context name. Let the command " +
+            "fail, or move it to a job that is not required.",
+        );
+      }
+    }
+  }
 }
 
 /**
@@ -534,6 +634,15 @@ export function deriveGatedJobRunCommands(source) {
         "commands the gate runs cannot be read",
     );
   }
+
+  // Run the same can-this-job-fail assertions here, not only in
+  // `deriveContextsFromSource`. This function answers "which commands does the
+  // gate run?", and a command in a step that is conditional, excused, or
+  // shell-suppressed is in the FILE without being in the GATE. Returning it
+  // regardless is what let `- if: false` pass every presence assertion in
+  // `test/typecheck-gate.test.mjs` while the step never executed.
+  assertJobCanFail(job);
+
   return steps
     .filter((step) => isMapping(step) && typeof step.run === "string")
     .map((step) => String(step.run));
