@@ -88,20 +88,59 @@ jobs:
       # `npm run build` typechecks `src/` only: tsconfig.json's `include` is
       # `src/**/*.ts`, so it never saw `bin/cli.mjs` — the file named in
       # package.json's `bin`, i.e. the one every `npx agentlens` invocation
-      # actually executes. A typo in an argv branch there shipped to npm with
-      # this gate green.
+      # actually executes — nor `scripts/`, which is the merge-gate machinery
+      # itself.
       #
       # `typecheck:bin` closes that with a separate `allowJs`+`checkJs` config
-      # (`tsconfig.check.json`, `noEmit` — the file is published verbatim and
-      # must never be overwritten by a compile step). It depends on `dist/`
-      # existing for the `../dist/index.js` import, which is why it runs AFTER
-      # build, not before.
+      # (`tsconfig.check.json`, `noEmit`). It depends on `dist/` existing for
+      # the `../dist/index.js` import, which is why it runs AFTER build, not
+      # before — with `dist/` absent it fails loudly but misleadingly, with
+      # three TS2307s buried under five lines of implicit-any noise.
       #
-      # Scope is the published entrypoint only. `examples/` and `test/` stay
-      # unchecked on purpose: ~40 of the 47 errors `checkJs` reports repo-wide
-      # are implicit-any in those dev-only fixtures, where a type error cannot
-      # reach a consumer. Widening to them is a separate pass, not a silent
-      # `include` edit.
+      # WHAT IT CATCHES, and what it does NOT. The previous version of this
+      # comment justified the whole step with "a typo in an argv branch there
+      # shipped to npm with this gate green". That was false, and measured to
+      # be false: argv dispatch was a `switch` over a plain `string`, which
+      # carries no exhaustiveness obligation, so a misspelled `case`, a
+      # misspelled `-o` flag literal and a wrongly-wired handler all passed
+      # with exit 0. The one defect class the comment named was the one class
+      # the gate was blind to.
+      #
+      # It genuinely catches: property typos against the imported Trace/Span
+      # types, wrong arity, wrong-typed arguments, a missing `await`,
+      # dereferencing the nullable `durationMs`, bad module specifiers and bad
+      # named imports, undeclared identifiers, and — since the command table
+      # became a `Record<Command, CommandHandler>` — a misspelled or unhandled
+      # command name.
+      #
+      # It still cannot catch: the WRONG handler wired to a correct command
+      # (the handlers are structurally identical), a misspelled flag literal
+      # (any string is a valid comparison operand), or Node-version-
+      # inappropriate APIs (`@types/node` is one version, `engines.node` is
+      # `>=20`). `npm test` covers the first two by running the built binary
+      # over the real command surface; this matrix covers the third.
+      #
+      # Scope: `bin/` and `scripts/`. `scripts/` is in because it decides
+      # whether `main` is protected at all — 16 unchecked errors lived there
+      # when it was excluded as "dev-only", including a TS2339 one line above
+      # an `Array.isArray(steps)` guard that failed open. `examples/` and
+      # `test/` are out for cost, not principle: re-measured at THIS commit
+      # under THESE compiler options they add 60 errors (examples/ 9,
+      # test/ 51), overwhelmingly implicit-any and possibly-undefined in
+      # fixtures. Typing `test/` is worth doing as its own pass —
+      # `checkJs` is the only tool that flags
+      # `assert.throws(fn, "string")`, which accepts ANY error.
+      #
+      # These counts are re-measured, not inherited. The figures this comment
+      # replaced ("47 repo-wide, ~40 in examples/ and test/") were a verbatim
+      # copy-forward from the comment BEFORE it and were already stale by one
+      # commit when they were presented as freshly verified.
+      #
+      # Deleting this step renames no status-check context, so nothing
+      # name-based would notice. `test/typecheck-gate.test.mjs` reads the
+      # PARSED workflow and asserts this step is present and ordered after
+      # `npm run build`, and compiles a fixture with a planted type defect to
+      # prove the gate still reports it.
       - run: npm run build
       - run: npm run typecheck:bin
       - run: npm test

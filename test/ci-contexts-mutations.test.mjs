@@ -554,22 +554,42 @@ test("continue-on-error on a STEP of the gated job fails closed", () => {
 
 // ---------------------------------------------------------------------------
 // Class 9 — degenerate documents. None may pass vacuously.
+//
+// The `steps:` stanza in the hand-built fixtures below is load-bearing, not
+// boilerplate: `assertJobCanFail` now REJECTS a gated job with no readable
+// `steps:` sequence (it used to skip its step-level `continue-on-error` check
+// silently in that case). Without the stanza these fixtures would fail closed
+// on the wrong assertion and stop testing the shape each one names — a passing
+// test that proves something other than its own title.
 // ---------------------------------------------------------------------------
 
-for (const [label, source, pattern] of [
+/** A minimal `steps:` stanza, so a fixture reaches the assertion it targets. */
+const MINIMAL_STEPS = "    steps:\n      - run: npm test\n";
+
+for (const [label, source, pattern] of /** @type {[string, string, RegExp][]} */ ([
   ["not valid YAML", "jobs:\n  test:\n   - [unclosed\n", /not valid YAML/],
   ["an empty document", "", /did not parse to a mapping/],
   ["a sequence document", "- a\n- b\n", /did not parse to a mapping/],
   ["no jobs: key", "name: CI\non: push\n", /no `jobs:` mapping/],
   ["jobs: is a sequence", "jobs:\n  - test\n", /no `jobs:` mapping/],
   [
+    "the gated job has no steps:",
+    "jobs:\n  test:\n    name: Node ${{ matrix.node }}\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        node: [20]\n",
+    /no `steps:` sequence/,
+  ],
+  [
+    "the gated job's steps: is not a sequence",
+    "jobs:\n  test:\n    name: Node ${{ matrix.node }}\n    runs-on: ubuntu-latest\n    steps: nope\n    strategy:\n      matrix:\n        node: [20]\n",
+    /no `steps:` sequence/,
+  ],
+  [
     "the gated job has no strategy:",
-    "jobs:\n  test:\n    name: Node ${{ matrix.node }}\n    runs-on: ubuntu-latest\n",
+    `jobs:\n  test:\n    name: Node \${{ matrix.node }}\n    runs-on: ubuntu-latest\n${MINIMAL_STEPS}`,
     /no `strategy:` mapping/,
   ],
   [
     "the gated job has no matrix:",
-    "jobs:\n  test:\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: false\n",
+    `jobs:\n  test:\n    runs-on: ubuntu-latest\n${MINIMAL_STEPS}    strategy:\n      fail-fast: false\n`,
     /has no `matrix:` mapping/,
   ],
   [
@@ -577,8 +597,18 @@ for (const [label, source, pattern] of [
     WORKFLOW.replace(`${NODE_LINE}\n`, `${NODE_LINE}\n${NODE_LINE.replace("[20, 22, 24]", "[99]")}\n`),
     /not valid YAML/,
   ],
-]) {
+])) {
   test(`degenerate input — ${label} — fails closed`, () => {
+    // `pattern` is annotated RegExp above, and that annotation is the whole
+    // point. It was previously inferred `string | RegExp` from the table, and
+    // `checkJs` flagged it (TS2769) precisely because Node's
+    // `assert.throws(fn, "some string")` treats the string as the ASSERTION'S
+    // OWN MESSAGE, not as a matcher — such a call accepts ANY error thrown,
+    // including one from a completely different failure path. Verified: swap
+    // one entry's /not valid YAML/ for "not valid YAML" and the whole suite
+    // still reports green with that guard accepting anything. In the suite
+    // whose job is catching merge-gate bypasses, that is the worst possible
+    // place for a vacuous assertion.
     assert.throws(() => deriveContextsFromSource(source), pattern);
   });
 }

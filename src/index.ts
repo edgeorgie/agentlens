@@ -175,9 +175,159 @@ export async function saveTrace(trace: Trace, path: string): Promise<void> {
   await writeFile(path, JSON.stringify(trace, null, 2), "utf8");
 }
 
+/**
+ * Aggregates spans by kind: `{ count, totalMs }` per kind, insertion-ordered.
+ *
+ * A `Map`, NOT an object literal, and that is the whole point of this function
+ * existing in `src/` rather than inline in the CLI.
+ *
+ * The CLI previously accumulated into a `{}` with
+ * `byKind[s.kind] ??= { count: 0, totalMs: 0 }`. For a span whose `kind`
+ * collides with an `Object.prototype` member (`constructor`, `toString`), that
+ * lookup returns the INHERITED value, which is not nullish, so `??=` assigned
+ * nothing, no own property was created, and `Object.entries` omitted the
+ * bucket: the span VANISHED from the latency breakdown while the span count
+ * printed above it still included it. (The revision before that printed a
+ * visible `count=NaN` row for the same input — garbage, but not silent. The
+ * `??=` rewrite was described in its PR as "incidental: one lookup instead of
+ * four". It was not behaviour-preserving.)
+ *
+ * `loadTrace` now validates `kind` against the real union, so a hostile kind
+ * does not survive the file boundary. This is the second layer, for any caller
+ * that constructs a Trace itself — and the layer that is directly unit
+ * testable, which the inline version was not.
+ */
+export function summarizeByKind(
+  spans: readonly Span[],
+): Map<string, { count: number; totalMs: number }> {
+  const byKind = new Map<string, { count: number; totalMs: number }>();
+  for (const s of spans) {
+    let bucket = byKind.get(s.kind);
+    if (bucket === undefined) {
+      bucket = { count: 0, totalMs: 0 };
+      byKind.set(s.kind, bucket);
+    }
+    bucket.count++;
+    bucket.totalMs += s.durationMs ?? 0;
+  }
+  return byKind;
+}
+
+const SPAN_KINDS: readonly SpanKind[] = [
+  "agent",
+  "llm",
+  "tool",
+  "retrieval",
+  "custom",
+];
+const SPAN_STATUSES: readonly SpanStatus[] = ["ok", "error", "running"];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Validates a parsed JSON value as a Trace.
+ *
+ * This exists because `loadTrace` used to be `JSON.parse(raw) as Trace` — an
+ * unchecked assertion about data the library does not produce. A trace.json is
+ * attacker-influenceable (span names and kinds come from whatever agent loop
+ * was instrumented), so every downstream `kind: SpanKind` annotation was a type
+ * assertion the compiler believed and the data need not satisfy. That lie had a
+ * concrete cost: the CLI's by-kind accumulator silently DROPPED any span whose
+ * `kind` collided with an `Object.prototype` member, and `tsc` could not see it
+ * because the type said such a kind was impossible.
+ *
+ * The honest fix is to make the assertion true at the boundary. Checks are
+ * structural and shallow-but-real: enough that every field the renderer and the
+ * CLI dereference exists with the right type, and that `kind`/`status` are
+ * actually in their unions. `attributes` and `meta` stay open by design — they
+ * are documented as free-form.
+ *
+ * @throws {TypeError} with a message naming the offending path, not a stack
+ *   trace from deep inside the renderer
+ */
+export function validateTrace(value: unknown, source = "trace"): Trace {
+  const fail = (message: string): never => {
+    throw new TypeError(`${source} is not a valid agentlens trace: ${message}`);
+  };
+
+  if (!isRecord(value)) {
+    return fail(
+      `expected a JSON object, got ${Array.isArray(value) ? "an array" : typeof value}`,
+    );
+  }
+  for (const key of ["traceId", "name"] as const) {
+    if (typeof value[key] !== "string") fail(`\`${key}\` must be a string`);
+  }
+  for (const key of ["startTime", "totalTokens", "totalCostUsd"] as const) {
+    if (typeof value[key] !== "number" || !Number.isFinite(value[key])) {
+      fail(`\`${key}\` must be a finite number`);
+    }
+  }
+  for (const key of ["endTime", "durationMs"] as const) {
+    const v = value[key];
+    if (v !== null && (typeof v !== "number" || !Number.isFinite(v))) {
+      fail(`\`${key}\` must be a finite number or null`);
+    }
+  }
+  if (!Array.isArray(value.spans)) fail("`spans` must be an array");
+  if (value.meta !== undefined && !isRecord(value.meta)) {
+    fail("`meta` must be an object when present");
+  }
+
+  const spans = value.spans as unknown[];
+  spans.forEach((span, i) => {
+    const at = `spans[${i}]`;
+    if (!isRecord(span)) return void fail(`${at} must be an object`);
+    for (const key of ["id", "name"] as const) {
+      if (typeof span[key] !== "string") fail(`${at}.${key} must be a string`);
+    }
+    if (span.parentId !== null && typeof span.parentId !== "string") {
+      fail(`${at}.parentId must be a string or null`);
+    }
+    if (!SPAN_KINDS.includes(span.kind as SpanKind)) {
+      fail(
+        `${at}.kind is ${JSON.stringify(span.kind)}, which is not one of ` +
+          `${SPAN_KINDS.join(", ")}. Reporting that here rather than ` +
+          "accepting it is deliberate: an out-of-union kind used to survive " +
+          "to the CLI's by-kind breakdown and silently vanish from it.",
+      );
+    }
+    if (!SPAN_STATUSES.includes(span.status as SpanStatus)) {
+      fail(
+        `${at}.status is ${JSON.stringify(span.status)}, not one of ` +
+          SPAN_STATUSES.join(", "),
+      );
+    }
+    if (typeof span.startTime !== "number" || !Number.isFinite(span.startTime)) {
+      fail(`${at}.startTime must be a finite number`);
+    }
+    for (const key of ["endTime", "durationMs"] as const) {
+      const v = span[key];
+      if (v !== null && (typeof v !== "number" || !Number.isFinite(v))) {
+        fail(`${at}.${key} must be a finite number or null`);
+      }
+    }
+    if (span.attributes !== undefined && !isRecord(span.attributes)) {
+      fail(`${at}.attributes must be an object when present`);
+    }
+  });
+
+  return value as unknown as Trace;
+}
+
 /** Load a Trace from a JSON file (for the CLI / renderer). */
 export async function loadTrace(path: string): Promise<Trace> {
   const { readFile } = await import("node:fs/promises");
   const raw = await readFile(path, "utf8");
-  return JSON.parse(raw) as Trace;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new TypeError(
+      `${path} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  return validateTrace(parsed, path);
 }

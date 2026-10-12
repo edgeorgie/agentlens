@@ -105,7 +105,7 @@ export function readMirroredContexts() {
  * one more place it diverged from the document GitHub reads.
  *
  * @param {string} source workflow YAML
- * @returns {object} the parsed workflow document
+ * @returns {Record<string, unknown>} the parsed workflow document
  * @throws {Error} if the source is not valid YAML or not a mapping
  */
 function parseWorkflow(source) {
@@ -115,7 +115,7 @@ function parseWorkflow(source) {
   } catch (error) {
     throw new Error(
       `ci.yml is not valid YAML, so the contexts it produces cannot be ` +
-        `derived: ${error.message}`,
+        `derived: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
   if (doc === null || typeof doc !== "object" || Array.isArray(doc)) {
@@ -165,6 +165,23 @@ function renderMatrixValue(value) {
 }
 
 /**
+ * Narrows an arbitrary parsed-YAML value to a plain mapping.
+ *
+ * Used at every step of the walk down `jobs.test.strategy.matrix` so each level
+ * is both runtime-checked and type-narrowed by the SAME expression. Previously
+ * the runtime checks were written out inline (`=== null || typeof !== "object"
+ * || Array.isArray`) while the reads that followed them were untyped, which is
+ * why `checkJs` reported `Property 'jobs' does not exist on type 'object'` —
+ * the guard narrowed to `object`, which has no properties.
+ *
+ * @param {unknown} value
+ * @returns {value is Record<string, unknown>}
+ */
+function isMapping(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
  * Derives the status-check context names a CI workflow produces, by reading the
  * parsed workflow document rather than restating it.
  *
@@ -188,7 +205,7 @@ export function deriveContextsFromSource(source) {
   const workflow = parseWorkflow(source);
 
   const jobs = workflow.jobs;
-  if (jobs === null || typeof jobs !== "object" || Array.isArray(jobs)) {
+  if (!isMapping(jobs)) {
     throw new Error(
       "ci.yml has no `jobs:` mapping — the workflow shape changed and this " +
         "guard's parser needs updating",
@@ -196,7 +213,7 @@ export function deriveContextsFromSource(source) {
   }
 
   const job = jobs[GATED_JOB_ID];
-  if (job === null || typeof job !== "object" || Array.isArray(job)) {
+  if (!isMapping(job)) {
     throw new Error(
       `ci.yml has no \`${GATED_JOB_ID}:\` job (jobs present: ` +
         `${Object.keys(jobs).join(", ") || "none"}). That job's matrix is ` +
@@ -211,7 +228,7 @@ export function deriveContextsFromSource(source) {
   assertJobCanFail(job);
 
   const strategy = job.strategy;
-  if (strategy === null || typeof strategy !== "object" || Array.isArray(strategy)) {
+  if (!isMapping(strategy)) {
     throw new Error(
       `ci.yml's \`${GATED_JOB_ID}:\` job has no \`strategy:\` mapping, so it ` +
         "is no longer a matrix job and produces a single context this guard " +
@@ -220,7 +237,7 @@ export function deriveContextsFromSource(source) {
   }
 
   const matrix = strategy.matrix;
-  if (matrix === null || typeof matrix !== "object" || Array.isArray(matrix)) {
+  if (!isMapping(matrix)) {
     throw new Error(
       `ci.yml's \`${GATED_JOB_ID}.strategy\` has no \`matrix:\` mapping ` +
         `(got ${Array.isArray(matrix) ? "a sequence" : typeof matrix}) — the ` +
@@ -339,7 +356,7 @@ const ANY_EXPRESSION = /\$\{\{[^}]*\}\}/g;
  *     threw when `name:` was missing, which is safe but wrong: removing the
  *     `name:` line is a plausible edit and the derived set is knowable.
  *
- * @param {object} job the parsed gated job
+ * @param {Record<string, unknown>} job the parsed gated job
  * @returns {string} a template containing `${{ matrix.node }}`
  * @throws {Error} if the name cannot be expanded by this guard
  */
@@ -414,7 +431,7 @@ function resolveJobNameTemplate(job) {
  * needed, the honest move is to split that work into a separate non-required
  * job, not to excuse it inside the gate.
  *
- * @param {object} job the parsed gated job
+ * @param {Record<string, unknown>} job the parsed gated job
  * @throws {Error} if the job cannot fail
  */
 function assertJobCanFail(job) {
@@ -442,22 +459,91 @@ function assertJobCanFail(job) {
   }
 
   const steps = job.steps;
-  if (Array.isArray(steps)) {
-    const excused = steps.filter(
-      (step) =>
-        step !== null &&
-        typeof step === "object" &&
-        "continue-on-error" in step &&
-        step["continue-on-error"] !== false,
+  // Fail CLOSED on an unreadable step list. This used to be a bare
+  // `if (Array.isArray(steps))` with no `else`: any shape other than an array —
+  // including `steps:` deleted entirely, or replaced by an anchor this parser
+  // does not resolve to a sequence — silently skipped the step-level
+  // `continue-on-error` check and the function returned as if it had verified
+  // something. That is the repo's recurring defect (a guard that passes
+  // vacuously) sitting inside the guard that exists to catch it. `checkJs`
+  // pointed straight at it: `TS2339: Property 'steps' does not exist on type
+  // 'object'`, one line above the guard.
+  if (!Array.isArray(steps)) {
+    throw new Error(
+      `ci.yml's \`${GATED_JOB_ID}:\` job has no \`steps:\` sequence (got ` +
+        `${steps === undefined ? "nothing" : typeof steps}). The gated job's ` +
+        "steps are where `continue-on-error` can disarm the gate without " +
+        "changing a single context name, so an unreadable step list is " +
+        "unverified, not clean.",
     );
-    if (excused.length > 0) {
-      throw new Error(
-        `ci.yml's \`${GATED_JOB_ID}:\` job has ${excused.length} step(s) ` +
-          "with `continue-on-error` set. A failing step that is excused does " +
-          "not fail the job, so that part of the gate cannot report red. " +
-          "Move the work to a separate non-required job instead of excusing " +
-          "it inside the gated one.",
-      );
-    }
   }
+
+  const excused = steps.filter(
+    (step) =>
+      step !== null &&
+      typeof step === "object" &&
+      "continue-on-error" in step &&
+      step["continue-on-error"] !== false,
+  );
+  if (excused.length > 0) {
+    throw new Error(
+      `ci.yml's \`${GATED_JOB_ID}:\` job has ${excused.length} step(s) ` +
+        "with `continue-on-error` set. A failing step that is excused does " +
+        "not fail the job, so that part of the gate cannot report red. " +
+        "Move the work to a separate non-required job instead of excusing " +
+        "it inside the gated one.",
+    );
+  }
+}
+
+/**
+ * Returns every `run:` command in the gated job, in order.
+ *
+ * WHY THIS EXISTS
+ *
+ * `deriveContextsFromSource` derives CONTEXT NAMES. Deleting a whole step from
+ * the gated job — say `- run: npm run typecheck:bin` — changes no context name,
+ * so the context derivation reports no drift, the three required checks stay
+ * green, and a merge gate silently disappears. That is the same shape as the
+ * six bypasses this file documents, one level down: not "the names drifted" but
+ * "the work behind the names vanished".
+ *
+ * `test/typecheck-gate.test.mjs` asserts the commands that constitute the gate
+ * are present in this list. It reads the PARSED document for the same reason
+ * everything else here does: a `grep` over ci.yml would match the string inside
+ * this very comment, and would miss a step injected through an anchor.
+ *
+ * @param {string} source workflow YAML
+ * @returns {string[]} the `run:` command strings of the gated job, in order
+ * @throws {Error} if the gated job cannot be read
+ */
+export function deriveGatedJobRunCommands(source) {
+  const workflow = parseWorkflow(source);
+  const jobs = workflow.jobs;
+  if (!isMapping(jobs)) {
+    throw new Error("ci.yml has no `jobs:` mapping");
+  }
+  const job = jobs[GATED_JOB_ID];
+  if (!isMapping(job)) {
+    throw new Error(`ci.yml has no \`${GATED_JOB_ID}:\` job`);
+  }
+  const steps = job.steps;
+  if (!Array.isArray(steps)) {
+    throw new Error(
+      `ci.yml's \`${GATED_JOB_ID}:\` job has no \`steps:\` sequence, so the ` +
+        "commands the gate runs cannot be read",
+    );
+  }
+  return steps
+    .filter((step) => isMapping(step) && typeof step.run === "string")
+    .map((step) => String(step.run));
+}
+
+/**
+ * `deriveGatedJobRunCommands` applied to the repository's own `ci.yml`.
+ *
+ * @returns {string[]}
+ */
+export function readGatedJobRunCommands() {
+  return deriveGatedJobRunCommands(readFileSync(WORKFLOW_PATH, "utf8"));
 }
