@@ -92,6 +92,53 @@ function fail(message) {
 }
 
 /**
+ * Message text for a caught value.
+ *
+ * `catch (error)` binds `unknown` under `strict`, and the old `error?.message
+ * ?? error` read a property off it unchecked — `checkJs` flagged three of
+ * those (TS18046 / TS2339 on `{}`). Not pedantry: a thrown non-Error (a string,
+ * or `undefined` from an aborted fetch) made that expression produce
+ * `"undefined"` inside the body of a GitHub issue this script files
+ * unattended.
+ *
+ * @param {unknown} error
+ * @returns {string}
+ */
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Narrows an arbitrary JSON value to a plain object with readable properties.
+ *
+ * The API responses this script walks (`rules`, `parameters`, a ruleset) are
+ * `unknown` by construction — they come off `res.json()`. The previous code
+ * read `.parameters?.required_status_checks`, `.strict_required_status_checks_policy`,
+ * `.name` and `.current_user_can_bypass` straight off values typed `object`,
+ * which `checkJs` reports as TS2339 one by one. Narrowing once here keeps the
+ * runtime behaviour and makes the reads honest.
+ *
+ * @param {unknown} value
+ * @returns {value is Record<string, unknown>}
+ */
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Reads a string property off an unknown API object, or `undefined`.
+ *
+ * @param {unknown} value
+ * @param {string} key
+ * @returns {string | undefined}
+ */
+function readString(value, key) {
+  if (!isRecord(value)) return undefined;
+  const v = value[key];
+  return typeof v === "string" ? v : undefined;
+}
+
+/**
  * GETs a GitHub API path, retrying transient failures so a single blip does not
  * produce a misleading report.
  *
@@ -116,6 +163,7 @@ function fail(message) {
  * @returns {Promise<{ok: true, body: unknown, link: string} | {ok: false, error: string}>}
  */
 async function fetchJson(path, { attempts = 3 } = {}) {
+  /** @type {Record<string, string>} */
   const headers = { Accept: "application/vnd.github+json" };
   // Authenticate when a token is present (private repos, and a far higher rate
   // limit), but do not require one: on a public repo these endpoints are
@@ -133,7 +181,7 @@ async function fetchJson(path, { attempts = 3 } = {}) {
       // fetch REJECTS on a DNS failure or socket reset rather than resolving.
       // Caught so it becomes a curated message instead of an unhandled
       // rejection whose stack trace gets pasted into a GitHub issue.
-      lastError = `network error contacting ${path}: ${error?.message ?? error}`;
+      lastError = `network error contacting ${path}: ${errorMessage(error)}`;
       if (attempt < attempts) {
         await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
         continue;
@@ -149,7 +197,7 @@ async function fetchJson(path, { attempts = 3 } = {}) {
           link: res.headers.get("link") ?? "",
         };
       } catch (error) {
-        lastError = `${path} returned unparseable JSON: ${error?.message ?? error}`;
+        lastError = `${path} returned unparseable JSON: ${errorMessage(error)}`;
         break;
       }
     }
@@ -175,12 +223,14 @@ async function fetchJson(path, { attempts = 3 } = {}) {
  * (This repository has 3 rules, so the practical effect today is nil. The point
  * is that the comment is now true.)
  *
- * @returns {Promise<Array<{type: string, ruleset_id?: number, parameters?: object}>>}
+ * @returns {Promise<Array<Record<string, unknown>>>}
  * @throws {Error} if the rules cannot be read
  */
 async function fetchLiveRules() {
+  /** @type {Array<Record<string, unknown>>} */
   const rules = [];
   const seen = new Set();
+  /** @type {string | null} */
   let path = `/repos/${REPO}/rules/branches/${BRANCH}?per_page=100`;
 
   while (path) {
@@ -198,7 +248,17 @@ async function fetchLiveRules() {
           JSON.stringify(result.body).slice(0, 200),
       );
     }
-    rules.push(...result.body);
+    // Each rule must be a readable object; a non-object entry is a response
+    // shape this guard does not model, so it is rejected rather than skipped.
+    for (const rule of result.body) {
+      if (!isRecord(rule)) {
+        throw new Error(
+          `the rules list contains a non-object entry (${typeof rule}); the ` +
+            "API response shape changed and this guard needs updating",
+        );
+      }
+      rules.push(rule);
+    }
 
     const next = result.link
       .split(",")
@@ -235,9 +295,22 @@ if (!statusCheckRule) {
   );
 }
 
-const live = (statusCheckRule.parameters?.required_status_checks ?? []).map(
-  (c) => c.context,
-);
+const live = (() => {
+  const params = statusCheckRule.parameters;
+  const checks = isRecord(params) ? params.required_status_checks : undefined;
+  if (checks === undefined) return [];
+  if (!Array.isArray(checks)) {
+    fail(
+      "the `required_status_checks` rule's `required_status_checks` " +
+        `parameter is ${typeof checks}, not an array; the API response shape ` +
+        "changed and this guard cannot read the required contexts. That is a " +
+        "failure rather than an empty list, because an empty list would read " +
+        "as \"protection requires nothing\" and produce a confidently wrong " +
+        "report.",
+    );
+  }
+  return /** @type {unknown[]} */ (checks).map((c) => readString(c, "context") ?? String(c));
+})();
 
 if (live.length === 0) {
   fail(
@@ -284,7 +357,10 @@ if (missing.length > 0 || extra.length > 0) {
   );
 }
 
-if (statusCheckRule.parameters?.strict_required_status_checks_policy !== true) {
+const strictPolicy = isRecord(statusCheckRule.parameters)
+  ? statusCheckRule.parameters.strict_required_status_checks_policy
+  : undefined;
+if (strictPolicy !== true) {
   fail(
     "the required contexts match, but `strict_required_status_checks_policy` " +
       "is false, so a PR can merge on a CI result from a stale base. The " +
@@ -362,29 +438,30 @@ for (const id of rulesetIds) {
     continue;
   }
   const ruleset = result.body;
-  if (ruleset === null || typeof ruleset !== "object") {
+  if (!isRecord(ruleset)) {
     unverified.push(
       `ruleset ${id}: NOT VERIFIED — expected a ruleset object, got ` +
         `${typeof ruleset}`,
     );
     continue;
   }
+  const rulesetName = readString(ruleset, "name");
 
   // The load-bearing distinction, and the whole of F2: `in` separates "the
   // field is absent because this caller may not see it" from "the field is
   // present and empty". `?? []` collapsed both into "clean".
   if (!("bypass_actors" in ruleset)) {
     unverified.push(
-      `ruleset ${id}${ruleset.name ? ` ("${ruleset.name}")` : ""}: NOT ` +
+      `ruleset ${id}${rulesetName ? ` ("${rulesetName}")` : ""}: NOT ` +
         "VERIFIED — the API WITHHELD `bypass_actors`. GitHub returns that " +
         "property only to callers with write access to the ruleset " +
         "(`Administration: write`), which `GITHUB_TOKEN` cannot be granted, " +
         "so this check cannot confirm the gate is unbypassable. Either run " +
         "this step with a PAT/App token that has that access, or accept the " +
         "blind spot explicitly with ALLOW_UNVERIFIED_BYPASS_ACTORS=1." +
-        (ruleset.current_user_can_bypass
+        (readString(ruleset, "current_user_can_bypass")
           ? ` (\`current_user_can_bypass\` for THIS token is ` +
-            `"${ruleset.current_user_can_bypass}" — that is a statement about ` +
+            `"${readString(ruleset, "current_user_can_bypass")}" — that is a statement about ` +
             "this caller only, not about other actors, so it is a partial " +
             "substitute and not a drop-in.)"
           : ""),
@@ -402,9 +479,14 @@ for (const id of rulesetIds) {
   }
   if (actors.length > 0) {
     bypassFindings.push(
-      `ruleset ${id} ("${ruleset.name}") grants ${actors.length} bypass ` +
-        `actor(s): ${actors
-          .map((a) => `${a.actor_type}#${a.actor_id} (${a.bypass_mode})`)
+      `ruleset ${id} ("${rulesetName ?? "unnamed"}") grants ${actors.length} bypass ` +
+        `actor(s): ${/** @type {unknown[]} */ (actors)
+          .map(
+            (a) =>
+              `${readString(a, "actor_type") ?? "?"}#${
+                isRecord(a) ? String(a.actor_id ?? "?") : "?"
+              } (${readString(a, "bypass_mode") ?? "?"})`,
+          )
           .join(", ")}`,
     );
   }
