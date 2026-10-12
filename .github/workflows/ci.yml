@@ -5,6 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: this job only reads the tree. It publishes nothing and
+# needs no token beyond checkout, so the default write-all token is dropped
+# rather than left implicit.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -15,7 +25,24 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 20
-      - run: npm install --include=dev
+          cache: npm
+      # `npm ci`, NOT `npm install`. This is load-bearing: `npm install`
+      # treats a package-lock.json that cannot satisfy package.json as a
+      # thing to silently REWRITE, so CI would pass while installing
+      # different versions than the committed lock pins — the lockfile the
+      # gate exists to validate is the one it would quietly discard.
+      # Measured on this repo: with package.json asking for typescript
+      # ^7.0.0 against a lock pinning 6.0.3, `npm install --include=dev`
+      # exits 0 and rewrites the lock to 7.0.2, while `npm ci` exits 1
+      # (`EUSAGE ... does not satisfy`). Every sibling repo in this fleet
+      # already uses `npm ci`; this was the last one that did not.
+      #
+      # --ignore-scripts: no package in this tree declares an install
+      # lifecycle script (verified against package-lock.json:
+      # `hasInstallScript == true` matches zero of 4 packages), so skipping
+      # them removes arbitrary third-party install-time code execution at no
+      # functional cost. Confirmed build/test/demo all still exit 0.
+      - run: npm ci --ignore-scripts
       - run: npm run build
       - run: npm test
       - run: npm run demo
