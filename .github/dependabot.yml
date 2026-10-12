@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  # This repo owns 1 Actions workflow(s), so action refs are a real
+  # dependency surface: a workflow pinned to a tag or SHA goes stale silently,
+  # and one pinned to a branch is not a dependency at all. Subscribing to the
+  # github-actions ecosystem turns an upstream move into a reviewable PR.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
