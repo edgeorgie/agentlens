@@ -5,44 +5,64 @@ on:
     branches: [main]
   pull_request:
 
-# Least privilege: this job only reads the tree. It publishes nothing and
-# needs no token beyond checkout, so the default write-all token is dropped
-# rather than left implicit.
+# Pinned explicitly so a change to the repository-level default cannot
+# silently widen this job's token. (The repo default is already `read`, so
+# this drops nothing today — it is defense against that setting changing.)
 permissions:
   contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Only cancel superseded PR runs. On `main`, the superseded run is the only
+  # evidence that commit ever built, so a burst of merges must not leave an
+  # intermediate commit with no completed CI result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
+    name: Node ${{ matrix.node }}
     runs-on: ubuntu-latest
-    env:
-      NODE_ENV: test
+    strategy:
+      fail-fast: false
+      matrix:
+        # package.json declares `engines.node: >=18`. Nothing tested that
+        # claim, and the job previously pinned only Node 20 — which reached
+        # end-of-life 2026-03-24, so CI validated against an unsupported
+        # runtime. 24 is current LTS.
+        node: [20, 22, 24]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: ${{ matrix.node }}
           cache: npm
-      # `npm ci`, NOT `npm install`. This is load-bearing: `npm install`
-      # treats a package-lock.json that cannot satisfy package.json as a
-      # thing to silently REWRITE, so CI would pass while installing
-      # different versions than the committed lock pins — the lockfile the
-      # gate exists to validate is the one it would quietly discard.
-      # Measured on this repo: with package.json asking for typescript
-      # ^7.0.0 against a lock pinning 6.0.3, `npm install --include=dev`
-      # exits 0 and rewrites the lock to 7.0.2, while `npm ci` exits 1
-      # (`EUSAGE ... does not satisfy`). Every sibling repo in this fleet
-      # already uses `npm ci`; this was the last one that did not.
+      # `npm ci`, NOT `npm install`: `npm install` rewrites a lockfile that
+      # cannot satisfy package.json, so CI would validate a tree that is not
+      # the committed one.
       #
-      # --ignore-scripts: no package in this tree declares an install
-      # lifecycle script (verified against package-lock.json:
-      # `hasInstallScript == true` matches zero of 4 packages), so skipping
-      # them removes arbitrary third-party install-time code execution at no
-      # functional cost. Confirmed build/test/demo all still exit 0.
-      - run: npm ci --ignore-scripts
+      # `--include=dev` is explicit on purpose. Every tool this job runs
+      # (typescript) is a devDependency, so if NODE_ENV ever arrives as
+      # `production` npm silently installs nothing and the next step fails
+      # with a confusing `tsc: not found` (exit 127). Do not rely on the
+      # absence of NODE_ENV for correctness here.
+      #
+      # `--ignore-scripts`: no package in this tree declares an install
+      # lifecycle script, so this costs nothing today and keeps install-time
+      # code execution off by default as the tree grows.
+      - run: npm ci --include=dev --ignore-scripts
+      # `npm run build` IS the typecheck: tsconfig.json has `strict: true`
+      # and `tsc` fails the build on any error in src/. Note what that does
+      # NOT cover — `include` is `src/**/*.ts`, so bin/cli.mjs, examples/ and
+      # test/ are unchecked. Bringing them in needs `allowJs`+`checkJs`,
+      # which currently reports 47 pre-existing errors (mostly TS7006
+      # implicit-any in the .mjs tests). That is a real backlog item, not
+      # something to bundle here: wiring it up now would land a gate that is
+      # red on arrival.
       - run: npm run build
       - run: npm test
-      - run: npm run demo
+      # Written to a temp path: the committed examples/demo-trace.* carry
+      # fresh UUIDs and timestamps on every run, so pointing the demo at the
+      # repo would leave CI with a dirty tree and make the step's own output
+      # indistinguishable from the committed fixture.
+      - run: npm run demo:ci
+      - run: npm audit --omit=dev --audit-level=high

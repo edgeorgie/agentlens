@@ -3,6 +3,7 @@
 // this demonstrates the TRACING library against a real (if simple) agent
 // loop with genuine nested spans, variable latency, and one induced error
 // so the waterfall shows what a failure looks like too.
+import { resolve } from "node:path";
 import { Tracer, saveTrace } from "../dist/index.js";
 
 // --- toy "tools" an agent might call -------------------------------------
@@ -94,9 +95,16 @@ async function runAgent(task) {
     return summary;
   }).finally(() => {}).then(async (summary) => {
     const trace = tracer.finish();
-    await saveTrace(trace, new URL("./demo-trace.json", import.meta.url).pathname);
+    // AGENTLENS_DEMO_OUT lets CI render the demo to a scratch path. Without
+    // it the demo overwrites the committed examples/demo-trace.json on every
+    // run (fresh UUIDs + timestamps), which leaves CI with a dirty tree and
+    // makes the step's own output indistinguishable from the fixture.
+    const out = process.env.AGENTLENS_DEMO_OUT
+      ? resolve(process.env.AGENTLENS_DEMO_OUT)
+      : new URL("./demo-trace.json", import.meta.url).pathname;
+    await saveTrace(trace, out);
     console.log("agent result:", summary);
-    console.log(`trace saved: examples/demo-trace.json (${trace.spans.length} spans, ${trace.durationMs}ms, $${trace.totalCostUsd.toFixed(5)})`);
+    console.log(`trace saved: ${out} (${trace.spans.length} spans, ${trace.durationMs}ms, $${trace.totalCostUsd.toFixed(5)})`);
     return summary;
   });
 }
