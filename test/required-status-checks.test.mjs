@@ -83,6 +83,48 @@ function deriveContextsFromWorkflow() {
     );
   }
 
+  // GitHub can change the SET of contexts without changing the `node:` line at
+  // all, and those are the dangerous edits because this parser reads values,
+  // not shape:
+  //
+  //   - `exclude:` removes a combination, so a listed version produces NO
+  //     context. Protection keeps requiring it and `main` wedges — the exact
+  //     #13 deadlock, straight through the guard meant to prevent it.
+  //   - `include:` adds a combination, so an unlisted context appears.
+  //   - a second matrix key (`os:`, `ts:`) multiplies every context name.
+  //
+  // Each is detected and throws, rather than being modelled. Modelling the
+  // full matrix-expansion algorithm in a regex parser would be its own source
+  // of silent wrongness; refusing to guess is the honest behaviour, and the
+  // error says exactly what to do.
+  const matrixBlock = yaml.slice(
+    yaml.indexOf(matrixMatch[0]) + matrixMatch[0].length,
+  );
+  const afterMatrix = matrixBlock.slice(0, matrixBlock.indexOf("\n    steps:"));
+
+  for (const stanza of ["include", "exclude"]) {
+    if (new RegExp(`^\\s+${stanza}:`, "m").test(afterMatrix)) {
+      throw new Error(
+        `ci.yml's matrix now uses an \`${stanza}:\` stanza, which changes ` +
+          "which contexts are produced without changing the `node:` list. " +
+          "This parser reads the `node:` list only, so it can no longer " +
+          "derive the real context set — it would pass while protection " +
+          "requires a context no run produces (or misses a new one). Update " +
+          "this guard to model the expansion, or drop the stanza.",
+      );
+    }
+  }
+
+  const extraKey = afterMatrix.match(/^\s+([a-zA-Z_][\w-]*):\s*\[/m);
+  if (extraKey) {
+    throw new Error(
+      `ci.yml's matrix has a second dimension \`${extraKey[1]}:\`, so each ` +
+        "context name is a combination of more than one matrix value. This " +
+        "parser expands `node:` alone and would derive the wrong context " +
+        "set. Update this guard to model the extra dimension.",
+    );
+  }
+
   return versions.map((v) =>
     nameTemplate.replaceAll("${{ matrix.node }}", v),
   );
@@ -92,15 +134,29 @@ test("required-status-checks mirror matches the contexts ci.yml produces", () =>
   const derived = deriveContextsFromWorkflow();
   const mirrored = readMirroredContexts();
 
+  // Compared as SETS, not sequences. Branch protection stores required
+  // contexts as an unordered collection — reordering the matrix changes
+  // nothing about what protection needs — so an order-sensitive assertion here
+  // would fail on a reorder that carries no risk at all, and send the reader
+  // to run a `gh api` call that was never necessary. A guard that cries wolf
+  // on a safe edit gets disabled, which costs more than the check is worth.
   assert.deepEqual(
-    mirrored,
-    derived,
+    [...mirrored].sort(),
+    [...derived].sort(),
     "`.github/required-status-checks.txt` is out of sync with ci.yml. " +
       `ci.yml now produces [${derived.join(", ")}] but the mirror lists ` +
       `[${mirrored.join(", ")}]. Update the mirror, then update branch ` +
       "protection with the `gh api` call documented at the top of that file " +
       "— otherwise protection will require contexts no run can produce and " +
       "`main` becomes unmergeable.",
+  );
+
+  assert.equal(
+    new Set(mirrored).size,
+    mirrored.length,
+    `the mirror lists a duplicate context: [${mirrored.join(", ")}]. ` +
+      "Protection treats contexts as a set, so a duplicate is always a typo " +
+      "and would mask a genuine mismatch once the lists are sorted.",
   );
 });
 
@@ -111,6 +167,22 @@ test("every required context is a Node version the package claims to support", (
   const declared = pkg.engines?.node;
   assert.ok(declared, "package.json must declare `engines.node`");
 
+  // Only a bare `>=N` / `>=N.N.N` range is understood. A compound range
+  // (`>=20 <23`), a caret/tilde range, or an `||` union all have an upper bound
+  // or a shape this check does not model: `/>=\s*(\d+)/` would find the floor
+  // and silently ignore the ceiling, so a matrix testing Node 24 against a
+  // declared `>=20 <23` would pass while advertising support it contradicts.
+  // Refusing to interpret is the honest behaviour — a guard that silently
+  // accepts a range it does not understand is worse than no guard.
+  assert.match(
+    declared,
+    /^>=\s*\d+(\.\d+)*$/,
+    `engines.node is ${JSON.stringify(declared)}, which this check does ` +
+      "not model. It understands only a bare `>=N` lower bound; a compound " +
+      "or upper-bounded range needs this guard extended rather than " +
+      "silently half-parsed.",
+  );
+
   const floor = declared.match(/>=\s*(\d+)/);
   assert.ok(
     floor,
@@ -119,8 +191,16 @@ test("every required context is a Node version the package claims to support", (
   const minSupported = Number(floor[1]);
 
   const tested = deriveContextsFromWorkflow().map((ctx) => {
-    const major = ctx.match(/(\d+)/);
-    assert.ok(major, `context ${JSON.stringify(ctx)} has no version number`);
+    // Anchored to the END of the context name: the name is
+    // `<prefix> <version>`, and an unanchored `/(\d+)/` would read the first
+    // digit anywhere in the prefix instead (a job named `CI2 Node 20` parses
+    // as major version 2).
+    const major = ctx.match(/(\d+)(?:\.\d+)*\s*$/);
+    assert.ok(
+      major,
+      `context ${JSON.stringify(ctx)} does not end in a version number, so ` +
+        "the Node version it tests cannot be read from its name",
+    );
     return Number(major[1]);
   });
 
