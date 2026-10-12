@@ -36,7 +36,7 @@
     "url": "https://github.com/edgeorgie/agentlens"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "devDependencies": {
     "typescript": "^6.0.3",
