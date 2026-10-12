@@ -28,8 +28,15 @@ jobs:
         # package.json declares `engines.node: >=20`, and
         # test/required-status-checks.test.mjs asserts that floor is a matrix
         # entry — so the declared support range is exercised at both ends
-        # rather than merely advertised. 20 is in maintenance until 2026-04-30
-        # (nodejs/Release schedule.json); 24 is current LTS.
+        # rather than merely advertised.
+        #
+        # Node 20 is PAST end-of-life (2026-04-30, nodejs/Release
+        # schedule.json) and is kept deliberately: it is the declared `engines`
+        # floor, so dropping it would leave the floor untested again, which is
+        # the defect this guard exists to catch. The honest options are to test
+        # it or to stop claiming it. Raising the floor to 22 and dropping 20 is
+        # the right next step; it is a consumer-visible narrowing and belongs
+        # in its own change, not bundled here.
         node: [20, 22, 24]
     steps:
       - uses: actions/checkout@v7
