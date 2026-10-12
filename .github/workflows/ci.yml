@@ -25,10 +25,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # package.json declares `engines.node: >=18`. Nothing tested that
-        # claim, and the job previously pinned only Node 20 — which reached
-        # end-of-life 2026-03-24, so CI validated against an unsupported
-        # runtime. 24 is current LTS.
+        # package.json declares `engines.node: >=20`, and
+        # test/required-status-checks.test.mjs asserts that floor is a matrix
+        # entry — so the declared support range is exercised at both ends
+        # rather than merely advertised. 20 is in maintenance until 2026-04-30
+        # (nodejs/Release schedule.json); 24 is current LTS.
         node: [20, 22, 24]
     steps:
       - uses: actions/checkout@v7
@@ -65,4 +66,14 @@ jobs:
       # repo would leave CI with a dirty tree and make the step's own output
       # indistinguishable from the committed fixture.
       - run: npm run demo:ci
-      - run: npm audit --omit=dev --audit-level=high
+      # `--omit=dev` was wrong here: this package has ZERO entries under
+      # `dependencies`, so the production tree is empty and the audit could not
+      # fail at any severity — a step that reported green unconditionally. The
+      # whole toolchain is a devDependency, which is exactly what a supply-chain
+      # audit of this repo needs to cover, so audit the full tree.
+      #
+      # `--audit-level=high` and not `critical`: high is the lowest threshold
+      # that does not make the gate permanently red on a transitive advisory
+      # with no patch path. `|| true` is deliberately NOT used — a gate that
+      # cannot fail is the defect being fixed, not a style preference.
+      - run: npm audit --audit-level=high
