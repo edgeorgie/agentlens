@@ -14,6 +14,11 @@ Usage:
 `);
 }
 
+/**
+ * Render a trace to a self-contained HTML waterfall.
+ * @param {string[]} args Positional args after `view`: `<trace.json> [-o out.html]`.
+ * @returns {Promise<void>}
+ */
 async function cmdView(args) {
   const inPath = args[0];
   if (!inPath) return usage();
@@ -25,16 +30,28 @@ async function cmdView(args) {
   console.log(`agentlens: wrote ${outPath} (${trace.spans.length} spans, ${trace.durationMs}ms total)`);
 }
 
+/**
+ * Print summary stats for one trace: duration, span count, tokens, cost, errors,
+ * and a per-kind breakdown.
+ * @param {string[]} args Positional args after `stats`: `<trace.json>`.
+ * @returns {Promise<void>}
+ */
 async function cmdStats(args) {
   const inPath = args[0];
   if (!inPath) return usage();
   const trace = await loadTrace(inPath);
   const errors = trace.spans.filter((s) => s.status === "error").length;
+  /**
+   * Accumulator keyed by `SpanKind`. Declared as a `Partial` record rather than a
+   * bare `{}` so indexing it with `s.kind` is checked against the real union —
+   * a typo like `byKind[s.knid]` is a compile error, not a silent `undefined`.
+   * @type {Partial<Record<import("../dist/index.js").SpanKind, { count: number, totalMs: number }>>}
+   */
   const byKind = {};
   for (const s of trace.spans) {
-    byKind[s.kind] = byKind[s.kind] ?? { count: 0, totalMs: 0 };
-    byKind[s.kind].count++;
-    byKind[s.kind].totalMs += s.durationMs ?? 0;
+    const bucket = (byKind[s.kind] ??= { count: 0, totalMs: 0 });
+    bucket.count++;
+    bucket.totalMs += s.durationMs ?? 0;
   }
   console.log(`agentlens stats — ${trace.name} (${trace.traceId})`);
   console.log(`  total duration : ${trace.durationMs}ms`);
@@ -48,6 +65,13 @@ async function cmdStats(args) {
   }
 }
 
+/**
+ * Compare two traces and report duration/token/cost deltas plus error-count change.
+ * Sets a non-zero exit code when the error count regressed, so this is usable as a
+ * CI gate.
+ * @param {string[]} args Positional args after `compare`: `<a.json> <b.json>`.
+ * @returns {Promise<void>}
+ */
 async function cmdCompare(args) {
   const [aPath, bPath] = args;
   if (!aPath || !bPath) return usage();

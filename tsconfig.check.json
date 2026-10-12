@@ -1,0 +1,33 @@
+{
+  "$comment": [
+    "The build (tsconfig.json) only covers src/**/*.ts. That left the ONE file every",
+    "consumer actually executes -- bin/cli.mjs, the `bin` entry in package.json --",
+    "checked by nothing: not by tsc, not by a linter. A typo in an argv branch there",
+    "ships to npm and fails on the user's machine while CI stays green.",
+    "",
+    "This config typechecks the shipped JavaScript via allowJs + checkJs. It is a",
+    "separate file rather than folded into tsconfig.json because (a) rootDir: src +",
+    "outDir: dist cannot also emit for bin/, and (b) this config must not emit at all",
+    "-- bin/cli.mjs is published verbatim and must never be overwritten by a compile",
+    "step.",
+    "",
+    "Scope is deliberately just the published entrypoint. examples/ and test/ are",
+    "development-only: a type error there cannot reach a consumer, and pulling them in",
+    "adds ~40 errors that would gate every PR on fixing fixtures. If they are ever",
+    "added, do it as its own pass -- do not widen this include silently."
+  ],
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": ["node"]
+  },
+  "include": ["bin/**/*.mjs"]
+}
