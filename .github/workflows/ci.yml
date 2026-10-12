@@ -9,11 +9,27 @@ on:
   # not tied to someone pushing code.
   schedule:
     - cron: "17 6 * * *"
-  # Fires the moment someone changes branch protection, instead of up to 24h
-  # later on the next scheduled run. The window between a bad settings change
-  # and its detection is the window in which `main` is silently wedged.
-  branch_protection_rule:
-    types: [created, edited, deleted]
+  # NOTE on what is deliberately NOT here: `branch_protection_rule`.
+  #
+  # A previous revision added that trigger with a comment promising detection
+  # "the moment someone changes branch protection". It cannot deliver that on
+  # this repository. `branch_protection_rule` is the CLASSIC branch-protection
+  # event, and `main` here has no classic protection at all
+  # (`GET /repos/edgeorgie/agentlens/branches/main/protection` → 404 "Branch not
+  # protected"); all protection comes from a ruleset, deliberately, because a
+  # ruleset is the only form a workflow can read (see
+  # scripts/check-live-protection.mjs). Ruleset changes emit `repository_ruleset`
+  # instead, and that event is not a workflow trigger — it does not appear in
+  # GitHub's "Events that trigger workflows" reference and there is no `on:` key
+  # for it. So editing the ruleset's required contexts — the exact #13 scenario
+  # this guard exists for — produced no event and no run, while the comment
+  # claimed otherwise.
+  #
+  # The cron above is therefore the real detection path, with a worst case of
+  # ~24h. Genuine instant detection needs a repository webhook on
+  # `repository_ruleset` forwarding to `repository_dispatch`; that is a real
+  # option, not done here, and it is honest to say the latency is a day rather
+  # than ship a trigger that cannot fire.
   workflow_dispatch:
 
 # Pinned explicitly so a change to the repository-level default cannot
@@ -115,11 +131,19 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
-      # `metadata: read` is the only permission GET /rules/branches/{branch}
-      # needs — and the reason this check is possible at all. Classic branch
-      # protection required `administration`, which GITHUB_TOKEN cannot be
-      # granted, so the live state was unreadable from a workflow until `main`
-      # was migrated to a ruleset.
+      # `metadata: read` (implied by `contents: read`) is what
+      # GET /rules/branches/{branch} needs, and the reason this check is
+      # possible at all. Classic branch protection required `administration`,
+      # which GITHUB_TOKEN cannot be granted, so the live state was unreadable
+      # from a workflow until `main` was migrated to a ruleset.
+      #
+      # It is NOT sufficient for everything the script would like to read:
+      # `bypass_actors` on GET /rulesets/{id} is returned only to callers with
+      # WRITE access to the ruleset (`Administration: write`), which
+      # GITHUB_TOKEN cannot have. An earlier revision of this file claimed
+      # metadata-read covered it; that was wrong, and the script's `?? []`
+      # turned the withheld field into a confident "no bypass actors". See
+      # ALLOW_UNVERIFIED_BYPASS_ACTORS below.
       contents: read
       # For the failure issue below. Without it nothing surfaces a red
       # scheduled run except a notification email to whoever last touched the
@@ -127,15 +151,46 @@ jobs:
       issues: write
     steps:
       - uses: actions/checkout@v7
-      # No `npm ci`: the script imports only node: builtins and uses global
-      # fetch, so installing the dev tree here would add a failure mode (and a
-      # registry dependency) the check does not need.
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+          cache: npm
+      # This step is NEW, and the comment it replaces said the opposite: "No
+      # `npm ci`: the script imports only node: builtins and uses global fetch".
+      # That is no longer true. `scripts/ci-contexts.mjs` now parses ci.yml with
+      # the `yaml` package instead of scanning it line by line, because five
+      # successive line-scanning implementations were each bypassed and a merge
+      # key (`<<: *anchor`) is invisible to any of them by construction. The
+      # dependency is the price of a derivation that cannot be fooled by
+      # reformatting, and it is a devDependency only — `dependencies` is empty
+      # and `files` ships just dist/, bin/ and README.md, so the published
+      # package's install surface is unchanged.
+      #
+      # `--ignore-scripts` keeps install-time code execution off. The added
+      # failure mode (a registry outage reds this job) is acceptable precisely
+      # because this job is NOT a required status check, and the `failure()`
+      # step below now survives a failure that happens before drift.log exists.
+      - run: npm ci --include=dev --ignore-scripts
       - id: check
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN structurally cannot read `bypass_actors` (see the
+          # permissions comment above), and the script now FAILS on an
+          # unreadable field rather than reporting a false all-clear. Without
+          # this flag that correct new behaviour would make this job red every
+          # single day — and file an issue — for a blind spot rather than for
+          # actual drift, which trains the reader to ignore it.
+          #
+          # So the blind spot is accepted EXPLICITLY here: with this set the
+          # script prints "bypass actors NOT VERIFIED" in its ✓ line and a ⚠
+          # per ruleset, instead of claiming there are none. Every assertion it
+          # CAN make (required contexts, strict policy, deletion,
+          # non_fast_forward) still runs and still fails the job.
+          #
+          # To make this a real check rather than a disclosed gap, give the step
+          # a PAT or GitHub App token with `Administration: write` and remove
+          # this line.
+          ALLOW_UNVERIFIED_BYPASS_ACTORS: "1"
         # `set -o pipefail` is load-bearing, not boilerplate: without it the
         # pipeline's exit code is `tee`'s, which is always 0, so a failing check
         # would report SUCCESS and the `failure()` step below would never run.
@@ -147,21 +202,54 @@ jobs:
       # nothing and would otherwise be seen by nobody. One deduplicated issue
       # is the notification path: reopened and commented if it already exists,
       # so a persistent problem does not spawn an issue per day.
+      #
+      # Deduplication is by LABEL, not by searching the title text. The
+      # previous version ran `gh issue list --search "$TITLE in:title"`, which
+      # is a word query over a bag of common words (branch, protection, main,
+      # drifted, ci.yml) — `in:title` restricts the field but does not make it
+      # a phrase match — then took `.[0]` of a relevance-ordered list with no
+      # client-side equality check. The success path below would then comment on
+      # and CLOSE whatever that happened to be. A label is an exact, indexed
+      # attribute, and the jq filter additionally requires an exact title match,
+      # so both paths resolve to the same issue or to none.
       - if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TITLE: "Branch protection on `main` has drifted from ci.yml"
+          LABEL: protection-drift
         run: |
-          body=$'The scheduled `protection-drift` check failed. `main`\'s live ruleset no longer matches the status checks `ci.yml` produces, which can leave the branch unmergeable or unguarded.\n\nRun: '"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"$'\n\n```\n'"$(cat drift.log)"$'\n```'
-          existing=$(gh issue list --state all --search "$TITLE in:title" \
-            --json number,state --jq '.[0] | select(.) | "\(.number) \(.state)"')
+          # `|| echo ...` and `2>/dev/null`: this step runs on ANY earlier
+          # failure in the job, including a checkout or setup-node failure that
+          # happens before drift.log is ever created. The default shell is
+          # `bash -e {0}`, so a failing command substitution inside an
+          # assignment aborts the step — which meant NO issue was filed in
+          # exactly the most opaque failure case, the one this notification
+          # path exists for.
+          log=$(cat drift.log 2>/dev/null || echo '(no drift.log — the job failed before the check step ran; see the run log)')
+          body=$'The scheduled `protection-drift` check failed. `main`\'s live ruleset no longer matches the status checks `ci.yml` produces, which can leave the branch unmergeable or unguarded.\n\nRun: '"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"$'\n\n```\n'"$log"$'\n```'
+          # --state all so a previously closed issue is reopened rather than
+          # duplicated. The success path uses the same --state for symmetry:
+          # when the two paths disagreed about state they could resolve to
+          # different issues.
+          # `--jq` here is gh's built-in jq, which does NOT accept `--arg`
+          # (verified: it reports "unknown arguments"), so the title is passed
+          # through the environment and read as `env.TITLE`.
+          existing=$(gh issue list --label "$LABEL" --state all \
+            --json number,state,title \
+            --jq 'map(select(.title == env.TITLE)) | .[0] | select(.) | "\(.number) \(.state)"')
           if [ -n "$existing" ]; then
             num=${existing%% *}
             state=${existing##* }
-            [ "$state" = "CLOSED" ] && gh issue reopen "$num"
+            # `if`, not `[ … ] && cmd`: under `bash -e` an `a && b` whose `a` is
+            # false evaluates to exit 1, which fails the step if it is the last
+            # command. The old form was safe only because another command
+            # happened to follow it.
+            if [ "$state" = "CLOSED" ]; then
+              gh issue reopen "$num"
+            fi
             gh issue comment "$num" --body "$body"
           else
-            gh issue create --title "$TITLE" --body "$body"
+            gh issue create --title "$TITLE" --label "$LABEL" --body "$body"
           fi
       # Closes the issue once the drift is gone, so a stale open issue does not
       # become the new thing nobody trusts.
@@ -169,9 +257,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TITLE: "Branch protection on `main` has drifted from ci.yml"
+          LABEL: protection-drift
         run: |
-          num=$(gh issue list --state open --search "$TITLE in:title" \
-            --json number --jq '.[0].number // empty')
+          # Same label, same --state, same exact-title filter as the failure
+          # path, so the two cannot resolve to different issues. `select(.state
+          # == "OPEN")` is applied after the exact match rather than via
+          # `--state open`, so the query is identical and only the action
+          # differs.
+          num=$(gh issue list --label "$LABEL" --state all \
+            --json number,state,title \
+            --jq 'map(select(.title == env.TITLE and .state == "OPEN")) | .[0].number // empty')
           if [ -n "$num" ]; then
             gh issue comment "$num" --body "Drift resolved: the live ruleset now matches \`ci.yml\`. Closing."
             gh issue close "$num"
