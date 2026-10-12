@@ -85,15 +85,25 @@ jobs:
       # lifecycle script, so this costs nothing today and keeps install-time
       # code execution off by default as the tree grows.
       - run: npm ci --include=dev --ignore-scripts
-      # `npm run build` IS the typecheck: tsconfig.json has `strict: true`
-      # and `tsc` fails the build on any error in src/. Note what that does
-      # NOT cover — `include` is `src/**/*.ts`, so bin/cli.mjs, examples/ and
-      # test/ are unchecked. Bringing them in needs `allowJs`+`checkJs`,
-      # which currently reports 47 pre-existing errors (mostly TS7006
-      # implicit-any in the .mjs tests). That is a real backlog item, not
-      # something to bundle here: wiring it up now would land a gate that is
-      # red on arrival.
+      # `npm run build` typechecks `src/` only: tsconfig.json's `include` is
+      # `src/**/*.ts`, so it never saw `bin/cli.mjs` — the file named in
+      # package.json's `bin`, i.e. the one every `npx agentlens` invocation
+      # actually executes. A typo in an argv branch there shipped to npm with
+      # this gate green.
+      #
+      # `typecheck:bin` closes that with a separate `allowJs`+`checkJs` config
+      # (`tsconfig.check.json`, `noEmit` — the file is published verbatim and
+      # must never be overwritten by a compile step). It depends on `dist/`
+      # existing for the `../dist/index.js` import, which is why it runs AFTER
+      # build, not before.
+      #
+      # Scope is the published entrypoint only. `examples/` and `test/` stay
+      # unchecked on purpose: ~40 of the 47 errors `checkJs` reports repo-wide
+      # are implicit-any in those dev-only fixtures, where a type error cannot
+      # reach a consumer. Widening to them is a separate pass, not a silent
+      # `include` edit.
       - run: npm run build
+      - run: npm run typecheck:bin
       - run: npm test
       # Written to a temp path: the committed examples/demo-trace.* carry
       # fresh UUIDs and timestamps on every run, so pointing the demo at the
