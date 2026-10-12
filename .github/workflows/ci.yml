@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # For `protection-drift` only. Its failure mode is a repository SETTINGS
+  # change, which no PR-time check can observe, so it needs a trigger that is
+  # not tied to someone pushing code.
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
 
 # Pinned explicitly so a change to the repository-level default cannot
 # silently widen this job's token. (The repo default is already `read`, so
@@ -84,3 +90,41 @@ jobs:
       # with no patch path. `|| true` is deliberately NOT used — a gate that
       # cannot fail is the defect being fixed, not a style preference.
       - run: npm audit --audit-level=high
+
+  # Asserts that the LIVE ruleset on `main` requires exactly the contexts the
+  # matrix above produces. The unit test in `test/` can only prove
+  # `mirror == workflow`; this proves `live protection == workflow`, which is
+  # the half that actually wedges `main`.
+  #
+  # Deliberately NOT a required status check, and deliberately not in the
+  # matrix job: it calls api.github.com, so a GitHub API incident would turn it
+  # red, and a network-dependent required context means an outage blocks
+  # merging — the exact deadlock this job exists to detect. It reports drift
+  # without holding the merge gate hostage.
+  #
+  # Skipped on pull_request: a PR cannot change repository settings, so there
+  # is nothing new for it to observe, and running it on forked PRs would spend
+  # an API call per push for a result that cannot differ from the scheduled one.
+  protection-drift:
+    name: Branch protection drift
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      # `metadata: read` is the only permission GET /rules/branches/{branch}
+      # needs — and the reason this check is possible at all. Classic branch
+      # protection required `administration`, which GITHUB_TOKEN cannot be
+      # granted, so the live state was unreadable from a workflow until `main`
+      # was migrated to a ruleset.
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      # No `npm ci`: the script imports only node: builtins and uses global
+      # fetch, so installing the dev tree here would add a failure mode (and a
+      # registry dependency) the check does not need.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: node scripts/check-live-protection.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
