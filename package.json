@@ -17,7 +17,8 @@
     "build": "tsc -p tsconfig.json",
     "pretest": "npm run build",
     "test": "node --test test/*.test.mjs",
-    "demo": "node examples/demo-agent.mjs && node bin/cli.mjs view examples/demo-trace.json -o examples/demo-trace.html"
+    "demo": "node examples/demo-agent.mjs && node bin/cli.mjs view examples/demo-trace.json -o examples/demo-trace.html",
+    "demo:ci": "AGENTLENS_DEMO_OUT=\"${TMPDIR:-/tmp}/agentlens-demo-trace.json\" node examples/demo-agent.mjs && node bin/cli.mjs view \"${TMPDIR:-/tmp}/agentlens-demo-trace.json\" -o \"${TMPDIR:-/tmp}/agentlens-demo-trace.html\""
   },
   "keywords": [
     "ai-agent",
