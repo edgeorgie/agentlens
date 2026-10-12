@@ -11,13 +11,23 @@ import { writeFile } from "node:fs/promises";
 //   0  success (and, for `compare`, no regression)
 //   1  the command ran and reported a regression / a trace failed to load
 //   2  the INVOCATION was wrong: unknown command, missing argument, flag
-//      without its value
+//      without its value, an UNRECOGNISED option, a surplus positional, or
+//      `-o ""`
 //
 // Code 2 is new. Previously every bad invocation printed usage and exited 0,
 // so `agentlens vieww t.json || echo failed` printed nothing and a typo in a
 // CI script was indistinguishable from success. A CLI that cannot report "you
 // called me wrong" is the same defect class as a required check that cannot
 // report red.
+//
+// The second half of that contract — unknown options and surplus positionals —
+// landed later and only after a reviewer measured that it did not hold:
+// `view t.json --unknown-flag`, `stats t.json extra`, `compare a b third` and
+// `view t.json -0 out.html` all exited 0, and the last of those wrote to the
+// DEFAULT output path while printing a success line. The parser is now
+// allow-list-shaped (see `parseArgs`): anything it does not recognise is a
+// usage error, and test/cli.test.mjs table-drives every row of this contract
+// including the ones that used to pass.
 const EXIT_USAGE = 2;
 const EXIT_ERROR = 1;
 
@@ -75,23 +85,97 @@ function usageError(message) {
 }
 
 /**
- * Reads the value of a `-o`/`--out` flag, if present.
+ * A subcommand's argv, after validation.
  *
- * Returns `null` when the flag is absent and `undefined` when it is present
- * with no value after it — two cases the caller must treat differently. The
- * second one used to reach `writeFile(undefined, …)` and die with a raw
- * `ERR_INVALID_ARG_TYPE` stack trace from node:internal (verified against the
- * published entrypoint: `agentlens view t.json -o` → unhandled TypeError,
- * exit 1). `noUncheckedIndexedAccess` in tsconfig.check.json is what makes
- * that `undefined` visible to the compiler rather than typed away as `string`.
+ * @typedef {{ positionals: string[], out: string | null }} ParsedArgs
+ */
+
+/**
+ * Splits a subcommand's argv into positionals and the one recognised flag,
+ * and REJECTS everything else. Returns `null` after reporting a usage error,
+ * so callers `if (parsed === null) return;`.
+ *
+ * Why a parser rather than the previous `args.findIndex(a => a === "-o")`:
+ * that version only ever LOOKED FOR tokens it knew. Anything else fell through
+ * into the positional slot or was ignored outright, so measured against the
+ * published entrypoint:
+ *
+ *   agentlens view t.json --unknown-flag   → exit 0, flag silently ignored
+ *   agentlens view t.json -0 out.html      → exit 0, wrote t.html (the DEFAULT
+ *                                            path), reported success
+ *   agentlens stats t.json extra-arg       → exit 0, extra arg ignored
+ *   agentlens compare a.json b.json third  → exit 0, third arg ignored
+ *   agentlens view t.json -o ""            → exit 1, raw `ENOENT: open ''`
+ *
+ * The `-0` row is the worst of them and is not hypothetical: `-0` is not
+ * recognised, so it and its filename both land in `positionals`, `out` stays
+ * null, and the file is written to the default path while stdout says
+ * "wrote …" about a path the user never asked for. Silent wrong output with a
+ * success exit code — the exact defect class this CLI's exit-code contract
+ * exists to make visible. Rejecting unknown `-`-prefixed tokens is what closes
+ * it; no amount of typechecking can, because any string is a valid `===`
+ * operand.
+ *
+ * An empty `-o ""` is a usage error (2), not an I/O error (1): the user did not
+ * hand us an unwritable path, they failed to hand us a path at all.
  *
  * @param {string[]} args
- * @returns {string | null | undefined}
+ * @param {{ command: Command, usageHint: string, maxPositionals: number, allowOut: boolean }} spec
+ * @returns {ParsedArgs | null}
  */
-function readOutFlag(args) {
-  const idx = args.findIndex((a) => a === "-o" || a === "--out");
-  if (idx < 0) return null;
-  return args[idx + 1];
+function parseArgs(args, spec) {
+  /** @type {string[]} */
+  const positionals = [];
+  /** @type {string | null} */
+  let out = null;
+
+  for (let i = 0; i < args.length; i += 1) {
+    const token = args[i];
+    // `noUncheckedIndexedAccess` types this as `string | undefined`; the index
+    // is in range by construction, but the narrowing is cheaper than a cast.
+    if (token === undefined) continue;
+
+    if (spec.allowOut && (token === "-o" || token === "--out")) {
+      const value = args[i + 1];
+      if (value === undefined) {
+        usageError("`-o` was given with no filename after it");
+        return null;
+      }
+      if (value === "") {
+        usageError("`-o` was given an empty filename");
+        return null;
+      }
+      out = value;
+      i += 1;
+      continue;
+    }
+
+    if (token.startsWith("-")) {
+      const didYouMean =
+        spec.allowOut && /^-+0$/.test(token) ? " (did you mean `-o`?)" : "";
+      usageError(
+        `unrecognised option ${JSON.stringify(token)} for \`${spec.command}\`` +
+          `${didYouMean}. Unknown options are rejected rather than ignored: ` +
+          "an ignored option means the command did something other than what " +
+          "was asked and still exited 0.",
+      );
+      return null;
+    }
+
+    positionals.push(token);
+  }
+
+  if (positionals.length > spec.maxPositionals) {
+    usageError(
+      `\`${spec.command}\` takes at most ${spec.maxPositionals} argument` +
+        `${spec.maxPositionals === 1 ? "" : "s"} but got ${positionals.length} ` +
+        `(${positionals.map((p) => JSON.stringify(p)).join(", ")}). ` +
+        `Surplus arguments are rejected rather than ignored. Usage: ${spec.usageHint}`,
+    );
+    return null;
+  }
+
+  return { positionals, out };
 }
 
 /**
@@ -100,15 +184,19 @@ function readOutFlag(args) {
  * @returns {Promise<void>}
  */
 async function cmdView(args) {
-  const inPath = args[0];
+  const parsed = parseArgs(args, {
+    command: "view",
+    usageHint: "agentlens view <trace.json> [-o out.html]",
+    maxPositionals: 1,
+    allowOut: true,
+  });
+  if (parsed === null) return;
+
+  const inPath = parsed.positionals[0];
   if (inPath === undefined) {
     return usageError("`view` needs a trace file: agentlens view <trace.json> [-o out.html]");
   }
-  const outFlag = readOutFlag(args);
-  if (outFlag === undefined) {
-    return usageError("`-o` was given with no filename after it");
-  }
-  const outPath = outFlag ?? inPath.replace(/\.json$/, "") + ".html";
+  const outPath = parsed.out ?? inPath.replace(/\.json$/, "") + ".html";
   const trace = await loadTrace(inPath);
   const html = renderHtml(trace);
   await writeFile(outPath, html, "utf8");
@@ -122,7 +210,15 @@ async function cmdView(args) {
  * @returns {Promise<void>}
  */
 async function cmdStats(args) {
-  const inPath = args[0];
+  const parsed = parseArgs(args, {
+    command: "stats",
+    usageHint: "agentlens stats <trace.json>",
+    maxPositionals: 1,
+    allowOut: false,
+  });
+  if (parsed === null) return;
+
+  const inPath = parsed.positionals[0];
   if (inPath === undefined) {
     return usageError("`stats` needs a trace file: agentlens stats <trace.json>");
   }
@@ -156,7 +252,15 @@ async function cmdStats(args) {
  * @returns {Promise<void>}
  */
 async function cmdCompare(args) {
-  const [aPath, bPath] = args;
+  const parsed = parseArgs(args, {
+    command: "compare",
+    usageHint: "agentlens compare <a.json> <b.json>",
+    maxPositionals: 2,
+    allowOut: false,
+  });
+  if (parsed === null) return;
+
+  const [aPath, bPath] = parsed.positionals;
   if (aPath === undefined || bPath === undefined) {
     return usageError("`compare` needs two trace files: agentlens compare <a.json> <b.json>");
   }
@@ -258,8 +362,12 @@ if (cmd === undefined || cmd === "--help" || cmd === "-h" || cmd === "help") {
 //     that runs each subcommand and asserts on ITS OWN output can see that —
 //     test/cli.test.mjs does exactly that.
 //   - Misspelled FLAG literals (`-0` for `-o`). Any string is a valid argument
-//     to `findIndex`/`===`. Same answer: the CLI tests assert that `-o <path>`
-//     actually writes to `<path>`.
+//     to a `===` comparison, so the compiler cannot tell `-0` from `-o`. The
+//     answer is not types but an allow-list parser: `parseArgs` rejects every
+//     `-`-prefixed token it does not recognise, so `-0` is now exit 2 with a
+//     "did you mean `-o`?" hint instead of a silent write to the default path.
+//     The CLI tests assert both that `-o <path>` writes to `<path>` and that
+//     `-0 <path>` writes nothing at all.
 //   - Node-version-inappropriate APIs. `@types/node` is a single version while
 //     `engines.node` is `>=20`, so an API added in 22 typechecks clean and
 //     crashes on the declared floor. The matrix job running the CLI on Node 20

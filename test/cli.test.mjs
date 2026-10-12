@@ -32,6 +32,13 @@ import { fileURLToPath } from "node:url";
 // 1 regression / unreadable trace, 2 bad invocation. Before this change EVERY
 // bad invocation exited 0, so `agentlens vieww t.json || echo failed` printed
 // nothing — a CLI that cannot report "you called me wrong".
+//
+// That claim was itself overstated when first written, and the correction is
+// the table below: asserting the contract for a hand-picked set of invocations
+// is not asserting the contract. Four bad invocations went on exiting 0 and
+// one exited 1, including `view t.json -0 out.html`, which wrote to the
+// DEFAULT path and printed a success line. The table enumerates every row of
+// the contract and checks that a rejected invocation also WROTE NOTHING.
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, "..");
@@ -210,6 +217,144 @@ test("no arguments prints usage on stdout and exits 0", () => {
   assert.match(r.stdout, /Usage:/);
   assert.match(r.stdout, /agentlens view <trace\.json>/);
 });
+
+// The exit-code contract, table-driven rather than hand-picked.
+//
+// The previous revision asserted this contract for the six invocations its
+// author thought of, and a reviewer falsified it with the first five he tried.
+// Measured against the published entrypoint at that revision:
+//
+//   view t.json --unknown-flag        exit 0, flag ignored, wrote output
+//   view t.json -0 out.html           exit 0, wrote the DEFAULT path, "wrote …"
+//   stats t.json extra-positional     exit 0, arg ignored
+//   compare a.json b.json third-arg   exit 0, arg ignored
+//   view t.json -o ""                 exit 1, raw `ENOENT: … open ''`
+//
+// Four invocation errors reported SUCCESS and one reported an I/O failure for
+// a usage mistake. The `-0` row is the one that matters most: it is a
+// silent-wrong-output bug in a published CLI, and it is the exact defect class
+// the comment at the top of this file says these tests exist to catch — a
+// misspelled flag literal that no type can see.
+//
+// A table, so adding a flag or a positional to any subcommand means adding its
+// rows here rather than remembering to. Every row below was executed against
+// the fixed binary; the four that previously exited 0 are the ones marked
+// "was 0" and each was re-run against the pre-fix binary to confirm the
+// assertion is not vacuous.
+for (const row of [
+  {
+    name: "an unrecognised long flag is rejected, not ignored (was 0)",
+    args: ["view", "<trace>", "--unknown-flag"],
+    status: 2,
+    stderr: /unrecognised option "--unknown-flag"/,
+    noDefaultOutput: true,
+  },
+  {
+    name: "`-0` (zero) is rejected and hints at `-o`, instead of writing to the default path (was 0, and wrote the wrong file)",
+    args: ["view", "<trace>", "-0", "<out>"],
+    status: 2,
+    stderr: /unrecognised option "-0".*did you mean `-o`/s,
+    noDefaultOutput: true,
+    noNamedOutput: true,
+  },
+  {
+    name: "an unrecognised short flag on `stats` is rejected (was 0)",
+    args: ["stats", "<trace>", "-x"],
+    status: 2,
+    stderr: /unrecognised option "-x"/,
+  },
+  {
+    name: "`-o` is rejected on `stats`, which does not write files",
+    args: ["stats", "<trace>", "-o", "<out>"],
+    status: 2,
+    stderr: /unrecognised option "-o"/,
+  },
+  {
+    name: "a surplus positional on `stats` is rejected, not ignored (was 0)",
+    args: ["stats", "<trace>", "extra-positional-arg"],
+    status: 2,
+    stderr: /`stats` takes at most 1 argument but got 2/,
+  },
+  {
+    name: "a surplus positional on `view` is rejected, not ignored (was 0)",
+    args: ["view", "<trace>", "extra-positional-arg"],
+    status: 2,
+    stderr: /`view` takes at most 1 argument but got 2/,
+    noDefaultOutput: true,
+  },
+  {
+    name: "a third positional on `compare` is rejected, not ignored (was 0)",
+    args: ["compare", "<trace>", "<trace>", "third-arg"],
+    status: 2,
+    stderr: /`compare` takes at most 2 arguments but got 3/,
+  },
+  {
+    name: "`-o ''` is a usage error, not a raw ENOENT (was 1)",
+    args: ["view", "<trace>", "-o", ""],
+    status: 2,
+    stderr: /`-o` was given an empty filename/,
+    stderrNot: /ENOENT|at .*node:internal/,
+    noDefaultOutput: true,
+  },
+  {
+    name: "`--out` with no value stays exit 2",
+    args: ["view", "<trace>", "--out"],
+    status: 2,
+    stderr: /`-o` was given with no filename after it/,
+  },
+  {
+    name: "a wrong-case command stays exit 2",
+    args: ["VIEW", "<trace>"],
+    status: 2,
+    stderr: /unknown command "VIEW"/,
+  },
+  {
+    name: "an unknown top-level flag stays exit 2",
+    args: ["--version"],
+    status: 2,
+    stderr: /unknown command "--version"/,
+  },
+]) {
+  test(`exit-code contract: ${row.name}`, () => {
+    const dir = fixtureDir();
+    try {
+      const out = join(dir, "named-output.html");
+      const args = row.args.map((a) =>
+        a === "<trace>" ? join(dir, "trace.json") : a === "<out>" ? out : a,
+      );
+      const r = run(args);
+
+      assert.equal(
+        r.status,
+        row.status,
+        `expected exit ${row.status}, got ${r.status}. ` +
+          `A bad invocation that exits 0 makes \`agentlens … || echo failed\` ` +
+          `print nothing.\nstdout:\n${r.stdout}\nstderr:\n${r.stderr}`,
+      );
+      assert.match(r.stderr, row.stderr);
+      if (row.stderrNot) assert.doesNotMatch(r.stderr, row.stderrNot);
+
+      // Rejecting the invocation is only half of it: the command must also not
+      // have done any of the work. This is the half that was actually broken.
+      if (row.noDefaultOutput) {
+        assert.ok(
+          !existsSync(join(dir, "trace.html")),
+          "the invocation was rejected but the DEFAULT output path was " +
+            "written anyway. This is the `-0 out.html` bug: the file lands " +
+            "somewhere the user never named while the CLI reports success.",
+        );
+      }
+      if (row.noNamedOutput) {
+        assert.ok(
+          !existsSync(out),
+          "the invocation was rejected but the named output path was written",
+        );
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
 
 test("an unknown command names the command, lists the valid ones, and exits 2", () => {
   const r = run(["vieww", "trace.json"]);

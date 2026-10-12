@@ -62,12 +62,36 @@
     "test/ci-contexts-mutations.test.mjs and is fixed; typing test/ properly is",
     "a worthwhile separate pass.",
     "",
+    "EXTENSIONS -- why the include is six entries and not one brace glob",
+    "",
+    "`files: [\"dist\",\"bin\",\"README.md\"]` publishes the whole bin/ DIRECTORY,",
+    "not just the one path package.json#bin names. An earlier revision globbed",
+    "`bin/**/*.mjs` only, and that was declined as theoretical on the grounds",
+    "that package.json#bin has a single entry. Measured: a bin/helper.js holding",
+    "two blatant type errors (an implicit-any parameter dereferenced as",
+    "x.nope.toUpperCase(), and a number multiplied by a string) left",
+    "`npm run typecheck:bin` at exit 0 with the gate's own self-test still",
+    "passing 4/4. A sibling helper next to the entrypoint is one `git add` away",
+    "and is the LIKELIER case than renaming the entrypoint, so the narrow glob",
+    "was a live hole in the publish surface, not a theoretical one.",
+    "",
+    "The obvious one-line fix -- `bin/**/*.{mjs,js,cjs}` -- does NOT work and",
+    "was rejected by measurement, not taste: tsc's include globs support only",
+    "*, ? and **, not brace alternation, so that pattern matches a literal",
+    "directory name and the config dies with",
+    "`error TS18003: No inputs were found`. Six explicit entries it is.",
+    "",
     "DO NOT WIDEN OR NARROW THIS SILENTLY. test/typecheck-gate.test.mjs reads",
     "this file, asserts the load-bearing options are present, resolves the",
-    "include against package.json#bin, and compiles a fixture with a planted",
-    "type defect to prove the gate still reports it. Deleting `checkJs` here",
-    "used to leave `npm run typecheck:bin` green on a file containing a real",
-    "type error; that is now a test failure."
+    "include against package.json#bin, asserts package.json's typecheck:bin",
+    "SCRIPT still points `tsc -p` at this exact file, and -- the real backstop --",
+    "copies the repo into a sandbox, plants type defects into the REAL",
+    "bin/cli.mjs and into new bin/*.js and bin/*.cjs siblings, and runs the",
+    "unmodified `npm run typecheck:bin` script there, requiring each defect to be",
+    "REPORTED by name. Deleting `checkJs` here, narrowing this include,",
+    "suppressing checking at the top of the entrypoint, or repointing the script",
+    "at a permissive config are all test failures -- each one was injected and",
+    "observed failing, not assumed."
   ],
   "compilerOptions": {
     "target": "ES2022",
@@ -87,5 +111,12 @@
     "forceConsistentCasingInFileNames": true,
     "types": ["node"]
   },
-  "include": ["bin/**/*.mjs", "scripts/**/*.mjs"]
+  "include": [
+    "bin/**/*.mjs",
+    "bin/**/*.js",
+    "bin/**/*.cjs",
+    "scripts/**/*.mjs",
+    "scripts/**/*.js",
+    "scripts/**/*.cjs"
+  ]
 }
